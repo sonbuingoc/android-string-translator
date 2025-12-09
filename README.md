@@ -5,8 +5,11 @@ Tool dịch strings.xml full tính năng:
 - Escape Android chuẩn
 - Config qua config.json
 - Dùng như submodule
-
-## Quick start
+## Thêm submodule vào project
+```
+git submodule add https://github.com/sonbuingoc/android-string-translator.git
+```
+## Sử dụng
 
 ```
 cd android-string-translator
