@@ -8,39 +8,44 @@ import xml.etree.ElementTree as ET
 import concurrent.futures
 import requests
 
-# =========================
-# Cấu hình đường dẫn
-# =========================
+def find_project_root(start: Path) -> Path:
+    cur = start
+    while cur != cur.parent:
+        if (cur / "settings.gradle").exists() or (cur / "settings.gradle.kts").exists():
+            return cur
+        cur = cur.parent
+    raise RuntimeError("❌ Không tìm thấy settings.gradle → không phải Android project")
 
-# Thư mục project chính (submodule nằm ở: <project>/android-string-translator/translate.py)
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_MODULE_NAME = "app"  # Nếu khác "app" thì sửa lại đây
 
+PROJECT_ROOT = find_project_root(Path(__file__).resolve())
 
 # =========================
 # Helper: tìm file strings.xml nguồn
 # =========================
 
 def find_source_strings() -> Path:
-    print("🔍 Đang tìm strings.xml trong project...")
+    print("🔍 Đang tìm strings.xml trong Android project...")
 
-    # Ưu tiên: app/src/main/res/values/strings.xml
-    candidate = PROJECT_ROOT / APP_MODULE_NAME / "src" / "main" / "res" / "values" / "strings.xml"
-    if candidate.exists():
-        print(f"✔ Tìm thấy file nguồn: {candidate}")
-        return candidate
-
-    # Fallback: scan toàn project
-    print("⚠ Không tìm thấy trong app/src/main/res/values/, thử scan toàn project...")
-    matches = list(PROJECT_ROOT.rglob("src/main/res/values/strings.xml"))
+    matches = list(
+        PROJECT_ROOT.rglob("src/main/res/values/strings.xml")
+    )
 
     if not matches:
-        raise FileNotFoundError("❌ Không tìm thấy strings.xml trong app/src/main/res/values/ hoặc bất kỳ module nào.")
+        raise FileNotFoundError(
+            "❌ Không tìm thấy strings.xml trong bất kỳ module nào (src/main/res/values)"
+        )
 
-    # Lấy file đầu tiên
+    # Ưu tiên module tên là app
+    for p in matches:
+        if "/app/" in str(p).replace("\\", "/"):
+            print(f"✔ Tìm thấy file nguồn (app): {p}")
+            return p
+
+    # Fallback: lấy file đầu tiên
     chosen = matches[0]
     print(f"✔ Tìm thấy file nguồn: {chosen}")
     return chosen
+
 
 
 # =========================
