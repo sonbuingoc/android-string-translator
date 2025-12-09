@@ -4,6 +4,5 @@
     "fr", "hi", "es", "zh", "pt-PT", "ru", "in", "en-PH",
     "bn", "pt-BR", "af-ZA", "de", "en-CA", "en-GB",
     "ko", "nl", "vi", "ar"
-  ],
-  "cache_file": ".translation_cache.json"
+  ]
 }

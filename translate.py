@@ -1,281 +1,239 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import json
-import argparse
-import requests
+import os
+from pathlib import Path
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
+import requests
 
-from escape import android_escape
+# =========================
+# Cấu hình đường dẫn
+# =========================
 
-
-# ==================== CONFIG ====================
-
-def load_config():
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg["source_language"], cfg["target_languages"], cfg["cache_file"]
+# Thư mục project chính (submodule nằm ở: <project>/android-string-translator/translate.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+APP_MODULE_NAME = "app"  # Nếu khác "app" thì sửa lại đây
 
 
-# ==================== SAFE PROJECT DETECTOR ====================
+# =========================
+# Helper: tìm file strings.xml nguồn
+# =========================
 
-def find_strings_in_current_project(script_dir):
+def find_source_strings() -> Path:
+    print("🔍 Đang tìm strings.xml trong project...")
+
+    # Ưu tiên: app/src/main/res/values/strings.xml
+    candidate = PROJECT_ROOT / APP_MODULE_NAME / "src" / "main" / "res" / "values" / "strings.xml"
+    if candidate.exists():
+        print(f"✔ Tìm thấy file nguồn: {candidate}")
+        return candidate
+
+    # Fallback: scan toàn project
+    print("⚠ Không tìm thấy trong app/src/main/res/values/, thử scan toàn project...")
+    matches = list(PROJECT_ROOT.rglob("src/main/res/values/strings.xml"))
+
+    if not matches:
+        raise FileNotFoundError("❌ Không tìm thấy strings.xml trong app/src/main/res/values/ hoặc bất kỳ module nào.")
+
+    # Lấy file đầu tiên
+    chosen = matches[0]
+    print(f"✔ Tìm thấy file nguồn: {chosen}")
+    return chosen
+
+
+# =========================
+# Helper: mapping locale -> thư mục values-*
+# =========================
+
+def locale_to_values_dir(lang_tag: str) -> str:
     """
-    Chỉ tìm strings.xml TRONG PROJECT chứa submodule.
-    Tuyệt đối không scan toàn workspace.
+    'fr'      -> 'values-fr'
+    'pt-BR'   -> 'values-pt-rBR'
+    'en-GB'   -> 'values-en-rGB'
+    'af-ZA'   -> 'values-af-rZA'
     """
-
-    project_root = os.path.abspath(os.path.join(script_dir, ".."))
-
-    # 1. Ưu tiên module "app"
-    app_strings = os.path.join(
-        project_root, "app", "src", "main", "res", "values", "strings.xml"
-    )
-    if os.path.exists(app_strings):
-        return app_strings
-
-    # 2. Nếu không có app → tìm module đầu tiên
-    candidates = []
-    for module in os.listdir(project_root):
-        module_path = os.path.join(project_root, module)
-        if not os.path.isdir(module_path):
-            continue
-
-        f = os.path.join(module_path, "src", "main", "res", "values", "strings.xml")
-        if os.path.exists(f):
-            candidates.append(f)
-
-    if not candidates:
-        print("❌ Không tìm thấy strings.xml trong project hiện tại.")
-        raise SystemExit(1)
-
-    return candidates[0]
+    parts = lang_tag.split("-")
+    if len(parts) == 1:
+        # Chỉ có language
+        return f"values-{parts[0]}"
+    else:
+        lang = parts[0]
+        region = parts[1].upper()
+        return f"values-{lang}-r{region}"
 
 
-def resolve_res_root(strings_file):
+# =========================
+# Android escape
+# =========================
+
+def android_escape(text: str) -> str:
     """
-    From: <project>/app/src/main/res/values/strings.xml
-    → To:  <project>/app/src/main/res
+    Escape string cho Android:
+    - Bảo vệ \' đã có sẵn, không double-escape.
+    - Escape &, <, >
+    - Escape ' còn lại thành \'
     """
-    return strings_file.split("/values/")[0]
+    if text is None:
+        return ""
+
+    # 0) Bảo vệ các \' đã có sẵn
+    PROTECTED_TOKEN = "__ESCAPED_SINGLE_QUOTE__"
+    protected = text.replace("\\'", PROTECTED_TOKEN)
+
+    # 1) Escape các ký tự XML cơ bản
+    protected = protected.replace("&", "&amp;")
+    protected = protected.replace("<", "&lt;")
+    protected = protected.replace(">", "&gt;")
+
+    # 2) Escape dấu nháy đơn còn lại
+    protected = protected.replace("'", "\\'")
+
+    # 3) Khôi phục lại các \' ban đầu
+    result = protected.replace(PROTECTED_TOKEN, "\\'")
+
+    return result
 
 
-# ==================== TRANSLATION ====================
+# =========================
+# Translate qua Google (free endpoint)
+# =========================
 
-MAX_WORKERS = 20
-BATCH_SIZE = 10
+def translate_text(text: str, source_lang: str, target_lang: str) -> str:
+    if not text.strip():
+        return text
 
-LOCALE_MAP = {
-    "in": "id",
-    "af-ZA": "af",
-    "en-PH": "en",
-    "en-CA": "en",
-    "en-GB": "en"
-}
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": source_lang,
+        "tl": target_lang,
+        "dt": "t",
+        "q": text
+    }
 
-
-def api_locale(locale: str) -> str:
-    return LOCALE_MAP.get(locale, locale)
-
-
-def translate_text(text, src, to):
     try:
-        resp = requests.get(
-            "https://api.mymemory.translated.net/get",
-            params={"q": text, "langpair": f"{src}|{to}"},
-            timeout=10
-        )
+        resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
-        return resp.json().get("responseData", {}).get("translatedText", text)
-    except:
+        data = resp.json()
+        # data[0] là list các đoạn, mỗi đoạn [translated, original, ...]
+        translated = "".join(chunk[0] for chunk in data[0])
+        return translated
+    except Exception as e:
+        print(f"[ERROR] Dịch thất bại ({source_lang}->{target_lang}): {e}")
+        # fallback: trả lại text gốc
         return text
 
 
-def batch_list(lst, size):
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
+# =========================
+# Đọc strings nguồn, bỏ qua translatable="false"
+# =========================
 
-
-def translate_locale_batch(key_map, src, locale):
-    target = api_locale(locale)
-
-    # Nếu cùng ngôn ngữ → giữ nguyên
-    if target.split("-")[0] == src:
-        return {k: v for k, v in key_map.items()}
-
-    results = {}
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-        future_map = {}
-
-        for chunk in batch_list(list(key_map.items()), BATCH_SIZE):
-            keys = [k for k, _ in chunk]
-            texts = [v for _, v in chunk]
-            joined = "\n###\n".join(texts)
-
-            future = exe.submit(translate_text, joined, src, target)
-            future_map[future] = (keys, texts)
-
-        for future in as_completed(future_map):
-            keys, texts = future_map[future]
-            out = future.result()
-            lines = out.split("\n###\n")
-
-            for i, key in enumerate(keys):
-                results[key] = lines[i]
-
-    return results
-
-
-# ==================== XML PARSE ====================
-
-def collect_texts(root):
-    key_map = {}
-
-    for child in root:
-        tag = child.tag
-
-        if tag == "string":
-            if child.get("translatable", "true") == "false":
-                continue
-            key = f"string::{child.get('name')}"
-            text = (child.text or "").strip()
-            if text:
-                key_map[key] = text
-
-        elif tag == "plurals":
-            if child.get("translatable", "true") == "false":
-                continue
-            name = child.get("name")
-            for item in child.findall("item"):
-                qty = item.get("quantity")
-                text = (item.text or "").strip()
-                if text:
-                    key_map[f"plurals::{name}::{qty}"] = text
-
-        elif tag == "string-array":
-            if child.get("translatable", "true") == "false":
-                continue
-            name = child.get("name")
-            for i, item in enumerate(child.findall("item")):
-                text = (item.text or "").strip()
-                if text:
-                    key_map[f"array::{name}::{i}"] = text
-
-    return key_map
-
-
-def build_translated_xml(root, translated):
-    new_root = ET.Element("resources")
-
-    for child in root:
-        tag = child.tag
-
-        if tag == "string":
-            name = child.get("name")
-            attrs = {"name": name}
-            if child.get("translatable") == "false":
-                attrs["translatable"] = "false"
-
-            elem = ET.SubElement(new_root, "string", attrs)
-            original = child.text or ""
-
-            if child.get("translatable") == "false":
-                elem.text = android_escape(original)
-            else:
-                key = f"string::{name}"
-                elem.text = android_escape(translated.get(key, original))
-
-        elif tag == "plurals":
-            name = child.get("name")
-            attrs = {"name": name}
-            if child.get("translatable") == "false":
-                attrs["translatable"] = "false"
-
-            p = ET.SubElement(new_root, "plurals", attrs)
-
-            for item in child.findall("item"):
-                qty = item.get("quantity")
-                original = item.text or ""
-                it = ET.SubElement(p, "item", {"quantity": qty})
-
-                if child.get("translatable") == "false":
-                    it.text = android_escape(original)
-                else:
-                    key = f"plurals::{name}::{qty}"
-                    it.text = android_escape(translated.get(key, original))
-
-        elif tag == "string-array":
-            name = child.get("name")
-            attrs = {"name": name}
-            if child.get("translatable") == "false":
-                attrs["translatable"] = "false"
-
-            arr = ET.SubElement(new_root, "string-array", attrs)
-
-            for i, item in enumerate(child.findall("item")):
-                original = item.text or ""
-                it = ET.SubElement(arr, "item")
-                if child.get("translatable") == "false":
-                    it.text = android_escape(original)
-                else:
-                    key = f"array::{name}::{i}"
-                    it.text = android_escape(translated.get(key, original))
-
-        else:
-            new_root.append(child)
-
-    return new_root
-
-
-# ==================== MAIN ====================
-
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Chỉ tìm strings.xml TRONG PROJECT HIỆN TẠI
-    strings_file = find_strings_in_current_project(script_dir)
-    res_root = resolve_res_root(strings_file)
-
-    source_lang, target_locales, cache_file = load_config()
-
-    print(f"\n✔ Project root: {os.path.abspath(os.path.join(script_dir, '..'))}")
-    print(f"✔ Using strings.xml: {strings_file}")
-    print(f"✔ Output to: {res_root}")
-
-    tree = ET.parse(strings_file)
+def load_source_strings(source_file: Path) -> dict:
+    tree = ET.parse(source_file)
     root = tree.getroot()
 
-    key_map = collect_texts(root)
-    print(f"🔍 Keys detected: {len(key_map)}")
+    strings = {}
 
-    for locale in target_locales:
-        print(f"\n🌍 Translating → {locale}")
+    for item in root.findall("string"):
+        name = item.get("name")
+        if not name:
+            continue
 
-        translated = translate_locale_batch(key_map, source_lang, locale)
-        new_root = build_translated_xml(root, translated)
+        # Bỏ qua translatable="false"
+        translatable = item.get("translatable")
+        if translatable is not None and translatable.lower() == "false":
+            # print(f"↷ Bỏ qua (translatable=false): {name}")
+            continue
 
-        folder = f"values-{locale}"
-        if "-" in locale:
-            lang, region = locale.split("-")
-            folder = f"values-{lang}-r{region.upper()}"
+        value = item.text or ""
+        strings[name] = value
 
-        out_dir = os.path.join(res_root, folder)
-        out_file = os.path.join(out_dir, "strings.xml")
+    print(f"✔ Đã load {len(strings)} string translatable từ {source_file}")
+    return strings
 
-        os.makedirs(out_dir, exist_ok=True)
 
-        xml_str = minidom.parseString(
-            ET.tostring(new_root, encoding="utf-8")
-        ).toprettyxml(indent="    ")
+# =========================
+# Dịch 1 item (dùng cho ThreadPool)
+# =========================
 
-        with open(out_file, "w", encoding="utf-8") as f:
-            f.write(xml_str)
+def translate_item(args):
+    key, value, source_lang, target_lang = args
+    translated = translate_text(value, source_lang, target_lang)
+    escaped = android_escape(translated)
+    return key, escaped
 
-        print(f"✔ Done: {out_file}")
 
-    print("\n🎉 FINISHED — SAFE MODE!")
+# =========================
+# Ghi file strings.xml đích
+# =========================
+
+def write_target_strings(module_res_dir: Path, locale_tag: str, translated_map: dict):
+    """
+    module_res_dir: ví dụ /<project>/app/src/main/res
+    locale_tag: ví dụ 'pt-BR'
+    """
+    values_dir_name = locale_to_values_dir(locale_tag)
+    out_dir = module_res_dir / values_dir_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = out_dir / "strings.xml"
+
+    lines = ['<resources>']
+    for key, value in translated_map.items():
+        lines.append(f'    <string name="{key}">{value}</string>')
+    lines.append('</resources>')
+
+    out_file.write_text("\n".join(lines), encoding="utf-8")
+    print(f"✔ Xuất file: {out_file}")
+
+
+# =========================
+# Main
+# =========================
+
+def main():
+    # Đọc config
+    config_path = Path(__file__).parent / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"❌ Không tìm thấy file config: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    source_lang = config.get("source_language", "en")
+    target_langs = config.get("target_languages", [])
+
+    # Tìm file nguồn
+    source_file = find_source_strings()
+
+    # app/src/main/res
+    module_res_dir = source_file.parent.parent  # .../res
+
+    # Load strings nguồn (bỏ qua translatable="false")
+    strings_map = load_source_strings(source_file)
+
+    # Dịch lần lượt từng ngôn ngữ
+    for lang in target_langs:
+        print(f"\n🌍 Đang dịch sang: {lang}")
+
+        tasks = [
+            (key, value, source_lang, lang)
+            for key, value in strings_map.items()
+        ]
+
+        translated_map = {}
+
+        # Dịch song song
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            for key, escaped_value in executor.map(translate_item, tasks):
+                translated_map[key] = escaped_value
+
+        # Ghi file ra đúng thư mục values-*
+        write_target_strings(module_res_dir, lang, translated_map)
+
+    print("\n🎉 DONE! Đã dịch xong tất cả ngôn ngữ.")
 
 
 if __name__ == "__main__":
