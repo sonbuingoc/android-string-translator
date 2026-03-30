@@ -70,15 +70,30 @@ def locale_to_values_dir(lang_tag: str) -> str:
 
 
 def android_escape(text: str) -> str:
+    """
+    Escape các ký tự đặc biệt cho Android XML.
+    Lưu ý: Không nên escape < và > nếu chúng là một phần của tag đã được restore.
+    Hàm này nên được gọi TRƯỚC khi restore tokens.
+    """
     if text is None:
         return ""
 
+    # Bảo vệ các dấu nháy đã được escape trước đó (nếu có)
     protected = text.replace("\\'", "__ESCAPED_SINGLE_QUOTE__")
+    protected = protected.replace('\\"', "__ESCAPED_DOUBLE_QUOTE__")
+
+    # Escape các ký tự đặc biệt XML/Android
     protected = protected.replace("&", "&amp;")
     protected = protected.replace("<", "&lt;")
     protected = protected.replace(">", "&gt;")
     protected = protected.replace("'", "\\'")
-    return protected.replace("__ESCAPED_SINGLE_QUOTE__", "\\'")
+    protected = protected.replace('"', '\\"')
+
+    # Khôi phục các dấu nháy đã bảo vệ
+    protected = protected.replace("__ESCAPED_SINGLE_QUOTE__", "\\'")
+    protected = protected.replace("__ESCAPED_DOUBLE_QUOTE__", '\\"')
+
+    return protected
 
 
 def inner_xml(element) -> str:
@@ -104,6 +119,8 @@ def replace_children_preserve_attrs(element, xml_fragment: str):
     element.tag = tag
     element.text = None
 
+    # Parse xml_fragment như một phần của XML
+    # Nếu fragment chứa các entity như &amp;, etree.fromstring sẽ tự giải mã chúng khi gán vào .text
     wrapper = etree.fromstring(
         f"<wrapper xmlns:xliff=\"{XLIFF_NS}\">{xml_fragment}</wrapper>",
         parser=get_parser(),
@@ -143,7 +160,8 @@ def protect_all(text: str):
 
 def restore_all(text: str, tokens: list) -> str:
     restored = text
-    for token, original in tokens:
+    # Duyệt ngược để tránh việc thay thế các token con (nếu có)
+    for token, original in reversed(tokens):
         restored = restored.replace(token, original)
     return restored
 
@@ -180,15 +198,20 @@ def translate_text(text: str, source_lang: str, target_lang: str, retries: int =
             resp.raise_for_status()
             data = resp.json()
             translated = "".join(chunk[0] for chunk in data[0])
+
+            # QUAN TRỌNG: Escape các ký tự đặc biệt của bản dịch TRƯỚC khi khôi phục tag/placeholder
+            translated = android_escape(translated)
             translated = restore_all(translated, tokens)
-            return android_escape(translated)
+
+            return translated
         except Exception as e:
             last_error = e
             if attempt < retries:
                 time.sleep(attempt)
 
     print(f"[ERROR] Dịch thất bại ({source_lang}->{target_lang}): {last_error}")
-    return android_escape(text)
+    # Nếu lỗi, trả về nguyên bản nhưng vẫn phải đảm bảo format XML hợp lệ
+    return text
 
 
 def make_string_item(name: str, text: str):
