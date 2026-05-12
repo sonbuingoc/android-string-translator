@@ -19,6 +19,8 @@ Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ
 - Dịch song song để tăng tốc
 - Hiển thị tiến trình theo từng ngôn ngữ, ví dụ `1/37`
 - Có option bỏ qua các mục đã dịch với `--skip-translated`
+- Có option chỉ dịch các id được chỉ định với `--ids`
+- Có option dịch từng từ riêng lẻ với `--word-by-word`
 - Bảo vệ placeholder và format Android tốt hơn:
   - `%s`, `%1$s`, `%d`, `%1$.2f`, `%%`
   - `{name}`, `{count}`
@@ -97,6 +99,44 @@ python3 translate.py --skip-translated
 python3 translate.py --skip-translated --workers 12
 ```
 
+### Chỉ dịch các id chỉ định
+
+```bash
+python3 translate.py --ids app_name welcome_message
+```
+
+Hoặc dùng dấu phẩy:
+
+```bash
+python3 translate.py --ids app_name,welcome_message
+```
+
+Với `plurals` và `string-array`, truyền resource name để dịch toàn bộ item bên trong:
+
+```bash
+python3 translate.py --ids deleted_files onboarding_steps
+```
+
+Nếu cần chỉ định chính xác một item nội bộ, có thể dùng key đầy đủ mà tool in ra trong progress:
+
+```bash
+python3 translate.py --ids plural::deleted_files::one string-array::onboarding_steps::0
+```
+
+Khi dùng `--ids`, tool sẽ đọc file dịch hiện có và giữ nguyên các id không được chọn nếu file đích đã tồn tại.
+
+### Dịch từng từ
+
+```bash
+python3 translate.py --word-by-word
+```
+
+Có thể kết hợp với `--ids` và `--skip-translated`:
+
+```bash
+python3 translate.py --ids app_name welcome_message --word-by-word --skip-translated
+```
+
 ## Cách tool hoạt động
 
 1. Tự động tìm file nguồn `strings.xml`
@@ -104,7 +144,8 @@ python3 translate.py --skip-translated --workers 12
 3. Bỏ qua các mục `translatable="false"`
 4. Dịch sang từng ngôn ngữ trong `config.json`
 5. Tạo file output trong đúng thư mục `values-*`
-6. Nếu dùng `--skip-translated`, các mục đã có bản dịch sẽ được giữ nguyên
+6. Nếu dùng `--ids`, chỉ các id được chọn được đưa vào hàng đợi dịch
+7. Nếu dùng `--skip-translated`, các mục đã có bản dịch sẽ được giữ nguyên
 
 ## Output
 

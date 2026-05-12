@@ -32,6 +32,8 @@ XML_TAG_PATTERN = re.compile(r"</?[^>]+?>", re.DOTALL)
 CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 ENTITY_PATTERN = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
 WHITESPACE_ONLY_PATTERN = re.compile(r"^\s*$")
+PROTECTED_TOKEN_PATTERN = re.compile(r"__[A-Z]+_\d+__")
+WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
 
 def get_parser():
@@ -214,6 +216,36 @@ def translate_text(text: str, source_lang: str, target_lang: str, retries: int =
     return text
 
 
+def translate_words_in_segment(segment: str, source_lang: str, target_lang: str) -> str:
+    parts = []
+    last_end = 0
+
+    for match in WORD_PATTERN.finditer(segment):
+        parts.append(android_escape(segment[last_end:match.start()]))
+        parts.append(translate_text(match.group(0), source_lang, target_lang))
+        last_end = match.end()
+
+    parts.append(android_escape(segment[last_end:]))
+    return "".join(parts)
+
+
+def translate_word_by_word(text: str, source_lang: str, target_lang: str) -> str:
+    if not should_translate_text(text):
+        return text or ""
+
+    protected_text, tokens = protect_all(text)
+    parts = []
+    last_end = 0
+
+    for match in PROTECTED_TOKEN_PATTERN.finditer(protected_text):
+        parts.append(translate_words_in_segment(protected_text[last_end:match.start()], source_lang, target_lang))
+        parts.append(match.group(0))
+        last_end = match.end()
+
+    parts.append(translate_words_in_segment(protected_text[last_end:], source_lang, target_lang))
+    return restore_all("".join(parts), tokens)
+
+
 def make_string_item(name: str, text: str):
     return {"kind": "string", "name": name, "text": text or ""}
 
@@ -383,9 +415,32 @@ def is_effectively_translated(existing_value: str, source_value: str) -> bool:
 
 
 def translate_item(task):
-    index, item, source_lang, target_lang = task
-    translated = translate_text(item["text"], source_lang, target_lang)
+    index, item, source_lang, target_lang, word_by_word = task
+    if word_by_word:
+        translated = translate_word_by_word(item["text"], source_lang, target_lang)
+    else:
+        translated = translate_text(item["text"], source_lang, target_lang)
     return index, item_key(item), translated
+
+
+def parse_id_filters(raw_ids):
+    if not raw_ids:
+        return set()
+
+    ids = set()
+    for raw in raw_ids:
+        for value in raw.split(","):
+            normalized = value.strip()
+            if normalized:
+                ids.add(normalized)
+    return ids
+
+
+def item_matches_id_filter(item: dict, id_filters) -> bool:
+    if not id_filters:
+        return True
+
+    return item["name"] in id_filters or item_key(item) in id_filters
 
 
 def build_output_element(resource: dict, translated_map: dict):
@@ -463,11 +518,25 @@ def parse_args():
         default=MAX_WORKERS,
         help="Số luồng dịch song song",
     )
+    parser.add_argument(
+        "--word-by-word",
+        action="store_true",
+        help="Dịch từng từ riêng lẻ thay vì dịch cả câu/cụm",
+    )
+    parser.add_argument(
+        "--ids",
+        nargs="+",
+        help=(
+            "Chỉ dịch các resource id được chỉ định. "
+            "Hỗ trợ dạng cách nhau bằng dấu cách hoặc dấu phẩy, ví dụ: --ids app_name title"
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    id_filters = parse_id_filters(args.ids)
 
     config_path = Path(__file__).parent / "config.json"
     if not config_path.exists():
@@ -487,16 +556,33 @@ def main():
     module_res_dir = source_file.parent.parent
     source_items, resources = load_source_items(source_file)
 
+    if id_filters:
+        matched_ids = {item["name"] for item in source_items if item_matches_id_filter(item, id_filters)}
+        unmatched_ids = id_filters - matched_ids - {item_key(item) for item in source_items}
+        print(f"🎯 Chỉ dịch {len(matched_ids)} resource id được chọn")
+        if unmatched_ids:
+            print(f"⚠ Không tìm thấy id trong file nguồn: {', '.join(sorted(unmatched_ids))}")
+
+    if args.word_by_word:
+        print("🔤 Chế độ dịch từng từ đang bật")
+
     for lang in target_langs:
         print(f"\n🌍 Đang dịch sang: {lang}")
 
-        existing_translations = load_existing_translations(module_res_dir, lang) if args.skip_translated else {}
+        existing_translations = (
+            load_existing_translations(module_res_dir, lang)
+            if args.skip_translated or id_filters
+            else {}
+        )
         translated_map = dict(existing_translations)
 
         tasks = []
         skipped_count = 0
 
         for item in source_items:
+            if not item_matches_id_filter(item, id_filters):
+                continue
+
             key = item_key(item)
             existing_value = existing_translations.get(key, "")
             if args.skip_translated and is_effectively_translated(existing_value, item["text"]):
@@ -518,7 +604,7 @@ def main():
         print(f"📝 Cần dịch {total_to_translate} mục cho {lang}")
 
         indexed_tasks = [
-            (index, item, source_lang, lang)
+            (index, item, source_lang, lang, args.word_by_word)
             for index, item in enumerate(tasks)
         ]
 
