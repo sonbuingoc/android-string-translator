@@ -406,10 +406,8 @@ def load_existing_translations(module_res_dir: Path, locale_tag: str) -> dict:
     return existing
 
 
-def is_effectively_translated(existing_value: str, source_value: str) -> bool:
+def has_existing_translation(existing_value: str) -> bool:
     if not existing_value or not existing_value.strip():
-        return False
-    if existing_value.strip() == source_value.strip():
         return False
     return True
 
@@ -585,7 +583,7 @@ def main():
 
             key = item_key(item)
             existing_value = existing_translations.get(key, "")
-            if args.skip_translated and is_effectively_translated(existing_value, item["text"]):
+            if args.skip_translated and has_existing_translation(existing_value):
                 skipped_count += 1
                 continue
             tasks.append(item)
