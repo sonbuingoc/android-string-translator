@@ -1,8 +1,23 @@
 {
   "source_language": "en",
   "target_languages": [
-    "fr", "hi", "es", "zh", "pt-PT", "ru", "in", "en-PH",
-    "bn", "pt-BR", "af-ZA", "de", "en-CA", "en-GB",
-    "ko", "nl", "vi", "ar"
+    "fr",
+    "hi",
+    "es",
+    "zh",
+    "pt",
+    "ru",
+    "in",
+    "tl",
+    "bn",
+    "pt-BR",
+    "af",
+    "de",
+    "en-CA",
+    "en-GB",
+    "ko",
+    "nl",
+    "vi",
+    "ar"
   ]
 }

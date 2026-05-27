@@ -34,6 +34,7 @@ ENTITY_PATTERN = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
 WHITESPACE_ONLY_PATTERN = re.compile(r"^\s*$")
 PROTECTED_TOKEN_PATTERN = re.compile(r"__[A-Z]+_\d+__")
 WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+PROTECTED_TOKEN_FULL_PATTERN = re.compile(r"__([A-Z]+)_(\d+)__")
 
 
 def get_parser():
@@ -165,7 +166,62 @@ def restore_all(text: str, tokens: list) -> str:
     # Duyệt ngược để tránh việc thay thế các token con (nếu có)
     for token, original in reversed(tokens):
         restored = restored.replace(token, original)
+
+    # Một số ngôn ngữ làm Google Translate sửa nhẹ token bảo vệ,
+    # ví dụ tl: __PRINTF_0__ -> __PRINF_0__. Khôi phục theo index nếu prefix gần đúng.
+    token_by_index = {}
+    for token, original in tokens:
+        match = PROTECTED_TOKEN_FULL_PATTERN.fullmatch(token)
+        if match:
+            token_by_index[int(match.group(2))] = (match.group(1), original)
+
+    def restore_mutated_token(match):
+        prefix = match.group(1)
+        index = int(match.group(2))
+        entry = token_by_index.get(index)
+        if not entry:
+            return match.group(0)
+
+        expected_prefix, original = entry
+        if prefixes_are_close(prefix, expected_prefix):
+            return original
+        return match.group(0)
+
+    restored = PROTECTED_TOKEN_FULL_PATTERN.sub(restore_mutated_token, restored)
     return restored
+
+
+def prefixes_are_close(value: str, expected: str) -> bool:
+    if value == expected:
+        return True
+    if abs(len(value) - len(expected)) > 1:
+        return False
+
+    i = 0
+    j = 0
+    edits = 0
+    while i < len(value) and j < len(expected):
+        if value[i] == expected[j]:
+            i += 1
+            j += 1
+            continue
+
+        edits += 1
+        if edits > 1:
+            return False
+
+        if len(value) == len(expected):
+            i += 1
+            j += 1
+        elif len(value) < len(expected):
+            j += 1
+        else:
+            i += 1
+
+    if i < len(value) or j < len(expected):
+        edits += 1
+
+    return edits <= 1
 
 
 def should_translate_text(text: str) -> bool:
