@@ -31,6 +31,7 @@ ESCAPE_SEQUENCE_PATTERN = re.compile(r"\\(?:n|t|r|'|\"|@|\?|u[0-9a-fA-F]{4})")
 XML_TAG_PATTERN = re.compile(r"</?[^>]+?>", re.DOTALL)
 CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 ENTITY_PATTERN = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
+BARE_AMPERSAND_PATTERN = re.compile(r"&(?![a-zA-Z]+;|#\d+;|#x[0-9a-fA-F]+;)")
 WHITESPACE_ONLY_PATTERN = re.compile(r"^\s*$")
 PROTECTED_TOKEN_PATTERN = re.compile(r"__[A-Z]+_\d+__")
 WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
@@ -102,10 +103,22 @@ def android_escape(text: str) -> str:
 def inner_xml(element) -> str:
     parts = []
     if element.text:
-        parts.append(element.text)
+        parts.append(escape_xml_text(element.text))
     for child in element:
         parts.append(etree.tostring(child, encoding="unicode"))
     return "".join(parts)
+
+
+def escape_xml_text(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def normalize_xml_fragment(xml_fragment: str) -> str:
+    return BARE_AMPERSAND_PATTERN.sub("&amp;", xml_fragment)
 
 
 def replace_children_preserve_attrs(element, xml_fragment: str):
@@ -125,7 +138,7 @@ def replace_children_preserve_attrs(element, xml_fragment: str):
     # Parse xml_fragment như một phần của XML
     # Nếu fragment chứa các entity như &amp;, etree.fromstring sẽ tự giải mã chúng khi gán vào .text
     wrapper = etree.fromstring(
-        f"<wrapper xmlns:xliff=\"{XLIFF_NS}\">{xml_fragment}</wrapper>",
+        f"<wrapper xmlns:xliff=\"{XLIFF_NS}\">{normalize_xml_fragment(xml_fragment)}</wrapper>",
         parser=get_parser(),
     )
 
