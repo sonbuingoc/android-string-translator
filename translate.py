@@ -560,6 +560,8 @@ def write_target_strings(module_res_dir: Path, locale_tag: str, resources: list,
     root = etree.Element("resources", nsmap={"xliff": XLIFF_NS})
 
     for resource in resources:
+        if resource.get("skip_translate"):
+            continue
         root.append(build_output_element(resource, translated_map))
 
     xml_bytes = etree.tostring(
