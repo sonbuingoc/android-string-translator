@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 from lxml import etree
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_MODULE_NAME = "app"
 
 MAX_WORKERS = 8
@@ -47,16 +47,27 @@ def get_parser():
     )
 
 
-def find_source_strings() -> Path:
-    print("🔍 Đang tìm strings.xml trong project...")
+def parse_project_root(raw_path: str) -> Path:
+    project_root = Path(raw_path).expanduser().resolve()
 
-    candidate = PROJECT_ROOT / APP_MODULE_NAME / "src" / "main" / "res" / "values" / "strings.xml"
+    if not project_root.is_dir():
+        raise argparse.ArgumentTypeError(
+            f"project root không tồn tại hoặc không phải thư mục: {project_root}"
+        )
+
+    return project_root
+
+
+def find_source_strings(project_root: Path) -> Path:
+    print(f"🔍 Đang tìm strings.xml trong project: {project_root}")
+
+    candidate = project_root / APP_MODULE_NAME / "src" / "main" / "res" / "values" / "strings.xml"
     if candidate.exists():
         print(f"✔ Tìm thấy file nguồn: {candidate}")
         return candidate
 
     print("⚠ Không tìm thấy trong app/src/main/res/values/, thử scan toàn project...")
-    matches = list(PROJECT_ROOT.rglob("src/main/res/values/strings.xml"))
+    matches = sorted(project_root.rglob("src/main/res/values/strings.xml"))
 
     if not matches:
         raise FileNotFoundError("❌ Không tìm thấy strings.xml trong project.")
@@ -600,6 +611,15 @@ def parse_args():
             "Hỗ trợ dạng cách nhau bằng dấu cách hoặc dấu phẩy, ví dụ: --ids app_name title"
         ),
     )
+    parser.add_argument(
+        "--project-root",
+        type=parse_project_root,
+        default=DEFAULT_PROJECT_ROOT,
+        help=(
+            "Đường dẫn Android project cần dịch. "
+            f"Mặc định: {DEFAULT_PROJECT_ROOT}"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -621,7 +641,7 @@ def main():
         print("⚠ Không có target_languages trong config.json")
         return
 
-    source_file = find_source_strings()
+    source_file = find_source_strings(args.project_root)
     module_res_dir = source_file.parent.parent
     source_items, resources = load_source_items(source_file)
 

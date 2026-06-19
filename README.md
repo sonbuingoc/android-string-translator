@@ -21,6 +21,7 @@ Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ
 - Có option bỏ qua các mục đã dịch với `--skip-translated`
 - Có option chỉ dịch các id được chỉ định với `--ids`
 - Có option dịch từng từ riêng lẻ với `--word-by-word`
+- Có option chỉ định Android project cần dịch với `--project-root`
 - Bảo vệ placeholder và format Android tốt hơn:
   - `%s`, `%1$s`, `%d`, `%1$.2f`, `%%`
   - `{name}`, `{count}`
@@ -87,6 +88,20 @@ Ví dụ:
 python3 translate.py
 ```
 
+Mặc định tool tìm Android project ở thư mục cha của repository này.
+
+### Chỉ định Android project root
+
+```bash
+python3 translate.py --project-root /path/to/android-project
+```
+
+Đường dẫn tương đối cũng được hỗ trợ và được tính từ thư mục đang chạy lệnh:
+
+```bash
+python3 translate.py --project-root ../my-android-app --skip-translated
+```
+
 ### Bỏ qua các mục đã dịch
 
 ```bash
@@ -139,7 +154,7 @@ python3 translate.py --ids app_name welcome_message --word-by-word --skip-transl
 
 ## Cách tool hoạt động
 
-1. Tự động tìm file nguồn `strings.xml`
+1. Tìm file nguồn `strings.xml` trong project mặc định hoặc project được truyền qua `--project-root`
 2. Đọc các resource có thể dịch từ `values/strings.xml`
 3. Bỏ qua các mục `translatable="false"`
 4. Dịch sang từng ngôn ngữ trong `config.json`
