@@ -22,9 +22,8 @@ REQUEST_TIMEOUT = 15
 XLIFF_NS = "urn:oasis:names:tc:xliff:document:1.2"
 NSMAP = {"xliff": XLIFF_NS}
 
-PRINTF_PLACEHOLDER_PATTERN = re.compile(
-    r"%(?:\d+\$)?[-#+ 0,(<]*\d*(?:\.\d+)?(?:[tT])?[a-zA-Z%]"
-)
+PRINTF_PLACEHOLDER = r"%(?:\d+\$)?[-#+ 0,(<]*\d*(?:\.\d+)?(?:[tT])?[a-zA-Z%]"
+PRINTF_PLACEHOLDER_PATTERN = re.compile(rf"(?:{PRINTF_PLACEHOLDER})+")
 BRACED_PLACEHOLDER_PATTERN = re.compile(r"\{[a-zA-Z0-9_]+\}")
 ANDROID_REF_PATTERN = re.compile(r"(?<!\\)(?:@[a-zA-Z0-9_./]+|\?[a-zA-Z0-9_./]+)")
 ESCAPE_SEQUENCE_PATTERN = re.compile(r"\\(?:n|t|r|'|\"|@|\?|u[0-9a-fA-F]{4})")
@@ -36,6 +35,7 @@ WHITESPACE_ONLY_PATTERN = re.compile(r"^\s*$")
 PROTECTED_TOKEN_PATTERN = re.compile(r"__[A-Z]+_\d+__")
 WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 PROTECTED_TOKEN_FULL_PATTERN = re.compile(r"__([A-Z]+)_(\d+)__")
+PROTECTED_TOKEN_DAMAGED_SUFFIX_PATTERN = re.compile(r"__([A-Z]+)_(\d+)_(?!_)")
 
 
 def get_parser():
@@ -212,6 +212,7 @@ def restore_all(text: str, tokens: list) -> str:
         return match.group(0)
 
     restored = PROTECTED_TOKEN_FULL_PATTERN.sub(restore_mutated_token, restored)
+    restored = PROTECTED_TOKEN_DAMAGED_SUFFIX_PATTERN.sub(restore_mutated_token, restored)
     return restored
 
 
