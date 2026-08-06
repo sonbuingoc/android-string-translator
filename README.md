@@ -1,12 +1,12 @@
 # android-string-translator
 
-Công cụ Python giúp dịch tự động `strings.xml` cho Android project.
+Công cụ Python giúp dịch tự động Android resource XML cho Android project.
 
-Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ `values/strings.xml` mà không cần thao tác thủ công trong Android Studio.
+Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ `values/strings.xml` hoặc `values/arrays.xml` mà không cần thao tác thủ công trong Android Studio.
 
 ## Tính năng
 
-- Tự động tìm file `strings.xml` nguồn
+- Tự động tìm file resource nguồn, mặc định là `strings.xml`
 - Bỏ qua các resource có `translatable="false"`
 - Hỗ trợ:
   - `string`
@@ -22,6 +22,7 @@ Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ
 - Có option chỉ dịch các id được chỉ định với `--ids`
 - Có option dịch từng từ riêng lẻ với `--word-by-word`
 - Có option chỉ định Android project cần dịch với `--project-root`
+- Có option chỉ định file resource cần dịch với `--resource-file`
 - Bảo vệ placeholder và format Android tốt hơn:
   - `%s`, `%1$s`, `%d`, `%1$.2f`, `%%`
   - `{name}`, `{count}`
@@ -77,7 +78,7 @@ Ví dụ:
 
 ### Ý nghĩa
 
-- `source_language`: ngôn ngữ gốc của file `strings.xml`
+- `source_language`: ngôn ngữ gốc của file resource nguồn
 - `target_languages`: danh sách ngôn ngữ cần dịch
 
 ## Cách dùng
@@ -100,6 +101,21 @@ python3 translate.py --project-root /path/to/android-project
 
 ```bash
 python3 translate.py --project-root ../my-android-app --skip-translated
+```
+
+### Dịch arrays.xml
+
+```bash
+python3 translate.py --resource-file arrays.xml --skip-translated
+```
+
+Với `string-array`, tool chỉ dịch text bên trong từng thẻ `<item>` và giữ nguyên resource name:
+
+```xml
+<string-array name="daily_charge_notification_messages">
+    <item>:zap: Ready? Watch paper come to life as art!</item>
+    <item>:battery: Boost your vibe — a new origami design awaits you.</item>
+</string-array>
 ```
 
 ### Bỏ qua các mục đã dịch
@@ -154,8 +170,8 @@ python3 translate.py --ids app_name welcome_message --word-by-word --skip-transl
 
 ## Cách tool hoạt động
 
-1. Tìm file nguồn `strings.xml` trong project mặc định hoặc project được truyền qua `--project-root`
-2. Đọc các resource có thể dịch từ `values/strings.xml`
+1. Tìm file nguồn trong project mặc định hoặc project được truyền qua `--project-root`
+2. Đọc các resource có thể dịch từ `values/<resource-file>`
 3. Bỏ qua các mục `translatable="false"`
 4. Dịch sang từng ngôn ngữ trong `config.json`
 5. Tạo file output trong đúng thư mục `values-*`
@@ -177,6 +193,13 @@ app/src/main/res/values-vi/strings.xml
 app/src/main/res/values-fr/strings.xml
 app/src/main/res/values-de/strings.xml
 app/src/main/res/values-pt-rBR/strings.xml
+```
+
+Nếu chạy với `--resource-file arrays.xml`, output sẽ giữ cùng tên file:
+
+```text
+app/src/main/res/values-vi/arrays.xml
+app/src/main/res/values-fr/arrays.xml
 ```
 
 ## Ví dụ tiến trình
