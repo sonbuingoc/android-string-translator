@@ -58,19 +58,32 @@ def parse_project_root(raw_path: str) -> Path:
     return project_root
 
 
-def find_source_strings(project_root: Path) -> Path:
-    print(f"🔍 Đang tìm strings.xml trong project: {project_root}")
+def parse_resource_file_name(raw_name: str) -> str:
+    resource_file = raw_name.strip()
 
-    candidate = project_root / APP_MODULE_NAME / "src" / "main" / "res" / "values" / "strings.xml"
+    if not resource_file:
+        raise argparse.ArgumentTypeError("resource file không được rỗng")
+    if Path(resource_file).name != resource_file or not resource_file.endswith(".xml"):
+        raise argparse.ArgumentTypeError(
+            "resource file phải là tên file XML trong thư mục values, ví dụ: strings.xml hoặc arrays.xml"
+        )
+
+    return resource_file
+
+
+def find_source_resource(project_root: Path, resource_file: str) -> Path:
+    print(f"🔍 Đang tìm {resource_file} trong project: {project_root}")
+
+    candidate = project_root / APP_MODULE_NAME / "src" / "main" / "res" / "values" / resource_file
     if candidate.exists():
         print(f"✔ Tìm thấy file nguồn: {candidate}")
         return candidate
 
     print("⚠ Không tìm thấy trong app/src/main/res/values/, thử scan toàn project...")
-    matches = sorted(project_root.rglob("src/main/res/values/strings.xml"))
+    matches = sorted(project_root.rglob(f"src/main/res/values/{resource_file}"))
 
     if not matches:
-        raise FileNotFoundError("❌ Không tìm thấy strings.xml trong project.")
+        raise FileNotFoundError(f"❌ Không tìm thấy {resource_file} trong project.")
 
     chosen = matches[0]
     print(f"✔ Tìm thấy file nguồn: {chosen}")
@@ -446,9 +459,9 @@ def load_source_items(source_file: Path):
     return items, resources
 
 
-def load_existing_translations(module_res_dir: Path, locale_tag: str) -> dict:
+def load_existing_translations(module_res_dir: Path, locale_tag: str, resource_file: str) -> dict:
     values_dir_name = locale_to_values_dir(locale_tag)
-    target_file = module_res_dir / values_dir_name / "strings.xml"
+    target_file = module_res_dir / values_dir_name / resource_file
 
     if not target_file.exists():
         return {}
@@ -562,12 +575,12 @@ def build_output_element(resource: dict, translated_map: dict):
     return deepcopy(resource["element"])
 
 
-def write_target_strings(module_res_dir: Path, locale_tag: str, resources: list, translated_map: dict):
+def write_target_resource(module_res_dir: Path, locale_tag: str, resource_file: str, resources: list, translated_map: dict):
     values_dir_name = locale_to_values_dir(locale_tag)
     out_dir = module_res_dir / values_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_file = out_dir / "strings.xml"
+    out_file = out_dir / resource_file
 
     root = etree.Element("resources", nsmap={"xliff": XLIFF_NS})
 
@@ -591,7 +604,7 @@ def parse_args():
     parser.add_argument(
         "--skip-translated",
         action="store_true",
-        help="Bỏ qua những mục đã có bản dịch trong file strings.xml đích",
+        help="Bỏ qua những mục đã có bản dịch trong file resource đích",
     )
     parser.add_argument(
         "--workers",
@@ -621,6 +634,12 @@ def parse_args():
             f"Mặc định: {DEFAULT_PROJECT_ROOT}"
         ),
     )
+    parser.add_argument(
+        "--resource-file",
+        type=parse_resource_file_name,
+        default="strings.xml",
+        help="Tên file resource trong values cần dịch, ví dụ: strings.xml hoặc arrays.xml",
+    )
     return parser.parse_args()
 
 
@@ -642,7 +661,7 @@ def main():
         print("⚠ Không có target_languages trong config.json")
         return
 
-    source_file = find_source_strings(args.project_root)
+    source_file = find_source_resource(args.project_root, args.resource_file)
     module_res_dir = source_file.parent.parent
     source_items, resources = load_source_items(source_file)
 
@@ -660,7 +679,7 @@ def main():
         print(f"\n🌍 Đang dịch sang: {lang}")
 
         existing_translations = (
-            load_existing_translations(module_res_dir, lang)
+            load_existing_translations(module_res_dir, lang, args.resource_file)
             if args.skip_translated or id_filters
             else {}
         )
@@ -688,7 +707,7 @@ def main():
 
         if total_to_translate == 0:
             print(f"✔ Không còn mục nào cần dịch cho {lang}")
-            write_target_strings(module_res_dir, lang, resources, translated_map)
+            write_target_resource(module_res_dir, lang, args.resource_file, resources, translated_map)
             continue
 
         print(f"📝 Cần dịch {total_to_translate} mục cho {lang}")
@@ -709,7 +728,7 @@ def main():
                 print(f"[{completed}/{total_to_translate}] {key}")
 
         translated_map.update(results)
-        write_target_strings(module_res_dir, lang, resources, translated_map)
+        write_target_resource(module_res_dir, lang, args.resource_file, resources, translated_map)
 
     print("\n🎉 DONE! Đã dịch xong tất cả ngôn ngữ.")
 
