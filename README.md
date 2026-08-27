@@ -16,13 +16,15 @@ Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ
   - `values-fr`
   - `values-vi`
   - `values-pt-rBR`
-- Dịch song song để tăng tốc
+- Có 3 translation engine: Google GTX, Argos Translate local, NLLB-200 local
+- Dịch song song theo số `Workers` cấu hình cho Google, Argos và NLLB
 - Hiển thị tiến trình theo từng ngôn ngữ, ví dụ `1/37`
 - Có option bỏ qua các mục đã dịch với `--skip-translated`
 - Có option chỉ dịch các id được chỉ định với `--ids`
 - Có option dịch từng từ riêng lẻ với `--word-by-word`
 - Có option chỉ định Android project cần dịch với `--project-root`
 - Có option chỉ định file resource cần dịch với `--resource-file`
+- Có option dịch cùng resource file trong tất cả module với `--all-modules`
 - Bảo vệ placeholder và format Android tốt hơn:
   - `%s`, `%1$s`, `%d`, `%1$.2f`, `%%`
   - `{name}`, `{count}`
@@ -34,9 +36,9 @@ Tool này phù hợp khi bạn muốn tạo nhanh các file đa ngôn ngữ từ
 ## Requirements
 
 - macOS / Linux / Windows
-- Python 3.8+
-- Internet connection
-- Google Translate free endpoint
+- Python 3.11 khuyến nghị/bắt buộc cho setup local engine trên macOS
+- Internet connection chỉ bắt buộc khi dùng Google hoặc lần đầu tải model/package local
+- Google Translate free endpoint, Argos Translate hoặc NLLB-200
 
 ## Cài đặt
 
@@ -62,6 +64,15 @@ Nếu bạn dùng bản nâng cao với `lxml` để giữ XML/comment/CDATA t�
 python3 -m pip install --upgrade pip
 python3 -m pip install requests lxml
 ```
+
+Cài đầy đủ cả Argos và NLLB bằng virtual environment riêng:
+
+```bash
+brew install python@3.11
+bash setup_local_engines.sh
+```
+
+Script sẽ tạo `.venv` và GUI sẽ tự dùng `.venv/bin/python3` khi có.
 
 ## Cấu hình
 
@@ -89,7 +100,26 @@ Ví dụ:
 python3 translate.py
 ```
 
+CLI mặc định vẫn dùng Google để tương thích với cách chạy cũ. Chọn local engine bằng:
+
+```bash
+python3 translate.py --engine argos
+python3 translate.py --engine nllb
+```
+
+Argos sẽ tự tải language package còn thiếu. NLLB sử dụng model `facebook/nllb-200-distilled-600M`; lần đầu chạy sẽ tải model từ Hugging Face, các lần sau dùng cache trên máy.
+
 Mặc định tool tìm Android project ở thư mục cha của repository này.
+
+### Chạy giao diện
+
+```bash
+python3 gui.py
+```
+
+GUI cho phép chọn Android project folder rồi tự scan từng file `src/main/res/values/*.xml` có `string`, `plurals` hoặc `string-array`. Mỗi file vật lý theo từng module/path được hiển thị riêng để người dùng chọn. GUI hỗ trợ `Argos (local)`, `NLLB-200 (local)` hoặc `Google GTX`; Argos là lựa chọn mặc định. Local engine tự tải model/package ở lần đầu và dùng cache local cho các lần sau. GUI cũng hỗ trợ `Skip translated`, `Word by word`, `Workers`, `IDs`, `source_language` và `target_languages`.
+
+GUI chạy bằng local web server và tự mở browser ở `http://127.0.0.1:<port>`. Trên macOS, nút `Choose Folder` sẽ mở folder picker native; trên hệ khác có thể paste đường dẫn project thủ công.
 
 ### Chỉ định Android project root
 
@@ -117,6 +147,26 @@ Với `string-array`, tool chỉ dịch text bên trong từng thẻ `<item>` v�
     <item>:battery: Boost your vibe — a new origami design awaits you.</item>
 </string-array>
 ```
+
+### Dịch tất cả module
+
+```bash
+python3 translate.py --all-modules --skip-translated
+```
+
+Mặc định tool chỉ dịch một file nguồn, ưu tiên module `app`. Khi bật `--all-modules`, tool sẽ scan toàn bộ Android project và dịch mọi file khớp dạng:
+
+```text
+*/src/main/res/values/strings.xml
+```
+
+Có thể kết hợp với `--resource-file` để dịch file khác trong tất cả module:
+
+```bash
+python3 translate.py --all-modules --resource-file arrays.xml --skip-translated
+```
+
+Nên dùng kèm `--skip-translated` để tránh dịch lại toàn bộ resource và giảm nguy cơ bị Google Translate free endpoint giới hạn request.
 
 ### Bỏ qua các mục đã dịch
 
@@ -177,6 +227,7 @@ python3 translate.py --ids app_name welcome_message --word-by-word --skip-transl
 5. Tạo file output trong đúng thư mục `values-*`
 6. Nếu dùng `--ids`, chỉ các id được chọn được đưa vào hàng đợi dịch
 7. Nếu dùng `--skip-translated`, các mục đã có bản dịch sẽ được giữ nguyên
+8. Nếu dùng `--all-modules`, các bước trên được chạy cho từng module có file nguồn khớp
 
 ## Output
 
@@ -205,14 +256,24 @@ app/src/main/res/values-fr/arrays.xml
 ## Ví dụ tiến trình
 
 ```text
-🌍 Đang dịch sang: vi
-↷ Bỏ qua 12 mục đã có bản dịch
-📝 Cần dịch 37 mục cho vi
-[1/37] string::app_name
-[2/37] string::welcome_message
-[3/37] plural::deleted_files::one
+== Module /path/to/app ==
+OK    Loaded 49 translatable item(s) from /path/to/app/src/main/res/values/strings.xml
+
+== Language [1/18] vi ==
+INFO  Items: total=49, translate=37, skipped=12, workers=8
+  [1/37] string::app_name
+  [2/37] string::welcome_message
+  [3/37] plural::deleted_files::one
 ...
-✔ Xuất file: /path/to/app/src/main/res/values-vi/strings.xml
+OK    Wrote /path/to/app/src/main/res/values-vi/strings.xml
+
+== Summary ==
+OK    Modules processed: 1/1
+OK    Languages processed: 18
+OK    Items translated: 37
+OK    Items skipped: 12
+OK    Files written: 18
+OK    Completed without translation errors.
 ```
 
 ## Hỗ trợ resource
@@ -254,6 +315,7 @@ Tool cố gắng tránh làm hỏng các token quan trọng trong Android string
 ## Lưu ý
 
 - Tool dùng Google Translate free endpoint nên có thể bị giới hạn hoặc lỗi tạm thời nếu gửi quá nhiều request
+- Nếu một item dịch lỗi, tool sẽ in `ERROR` theo language/resource key, giữ text gốc cho item đó, và tổng hợp lỗi ở cuối run
 - Bản dịch tự động nên được kiểm tra lại với các câu có ngữ cảnh đặc biệt
 - Với XML phức tạp, bản dùng `lxml` sẽ giữ cấu trúc tốt hơn bản dùng `xml.etree`
 - Nếu một mục đã có bản dịch nhưng thực ra chưa đúng, hãy tắt `--skip-translated` để dịch lại

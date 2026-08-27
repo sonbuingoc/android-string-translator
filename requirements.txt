@@ -1,0 +1,8 @@
+requests>=2.31
+lxml>=4.9
+
+# Local translation engines
+argostranslate==1.11.0
+transformers>=4.40,<5
+sentencepiece>=0.2.1
+torch>=2.1

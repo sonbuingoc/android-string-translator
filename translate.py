@@ -5,11 +5,12 @@ import argparse
 import concurrent.futures
 import json
 import re
+import threading
 import time
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import requests
 from lxml import etree
 
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,36 @@ APP_MODULE_NAME = "app"
 MAX_WORKERS = 8
 RETRY_COUNT = 3
 REQUEST_TIMEOUT = 15
+
+ENGINE_GOOGLE = "google"
+ENGINE_ARGOS = "argos"
+ENGINE_NLLB = "nllb"
+SUPPORTED_ENGINES = (ENGINE_GOOGLE, ENGINE_ARGOS, ENGINE_NLLB)
+NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+
+LOCAL_ENGINE_LOCK = threading.Lock()
+ARGOS_PACKAGE_INDEX_READY = False
+NLLB_STATE = None
+
+NLLB_LANGUAGE_CODES = {
+    "af": "afr_Latn",
+    "ar": "arb_Arab",
+    "bn": "ben_Beng",
+    "de": "deu_Latn",
+    "en": "eng_Latn",
+    "es": "spa_Latn",
+    "fil": "tgl_Latn",
+    "fr": "fra_Latn",
+    "hi": "hin_Deva",
+    "id": "ind_Latn",
+    "in": "ind_Latn",
+    "ko": "kor_Hang",
+    "nl": "nld_Latn",
+    "pt": "por_Latn",
+    "ru": "rus_Cyrl",
+    "vi": "vie_Latn",
+    "zh": "zho_Hans",
+}
 
 XLIFF_NS = "urn:oasis:names:tc:xliff:document:1.2"
 NSMAP = {"xliff": XLIFF_NS}
@@ -36,6 +67,60 @@ PROTECTED_TOKEN_PATTERN = re.compile(r"__[A-Z]+_\d+__")
 WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 PROTECTED_TOKEN_FULL_PATTERN = re.compile(r"__([A-Z]+)_(\d+)__")
 PROTECTED_TOKEN_DAMAGED_SUFFIX_PATTERN = re.compile(r"__([A-Z]+)_(\d+)_(?!_)")
+
+
+@dataclass
+class RunStats:
+    modules_total: int = 0
+    modules_processed: int = 0
+    languages_processed: int = 0
+    items_translated: int = 0
+    items_skipped: int = 0
+    files_written: int = 0
+    warnings: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+
+
+def log_section(title: str):
+    print(f"\n== {title} ==")
+
+
+def log_info(message: str):
+    print(f"INFO  {message}")
+
+
+def log_success(message: str):
+    print(f"OK    {message}")
+
+
+def log_warning(message: str, stats=None):
+    print(f"WARN  {message}")
+    if stats is not None:
+        stats.warnings.append(message)
+
+
+def log_error(message: str, stats=None):
+    print(f"ERROR {message}")
+    if stats is not None:
+        stats.errors.append(message)
+
+
+def run_with_heartbeat(label: str, action, interval_seconds: int = 5):
+    done = threading.Event()
+    started_at = time.time()
+
+    def heartbeat():
+        while not done.wait(interval_seconds):
+            elapsed = int(time.time() - started_at)
+            log_info(f"{label}... {elapsed}s elapsed")
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        return action()
+    finally:
+        done.set()
+        thread.join(timeout=0.2)
 
 
 def get_parser():
@@ -72,22 +157,35 @@ def parse_resource_file_name(raw_name: str) -> str:
 
 
 def find_source_resource(project_root: Path, resource_file: str) -> Path:
-    print(f"🔍 Đang tìm {resource_file} trong project: {project_root}")
+    log_info(f"Finding {resource_file} in project: {project_root}")
 
     candidate = project_root / APP_MODULE_NAME / "src" / "main" / "res" / "values" / resource_file
     if candidate.exists():
-        print(f"✔ Tìm thấy file nguồn: {candidate}")
+        log_success(f"Source file: {candidate}")
         return candidate
 
-    print("⚠ Không tìm thấy trong app/src/main/res/values/, thử scan toàn project...")
+    log_warning("app/src/main/res/values not found; scanning the project for the first matching source file.")
     matches = sorted(project_root.rglob(f"src/main/res/values/{resource_file}"))
 
     if not matches:
-        raise FileNotFoundError(f"❌ Không tìm thấy {resource_file} trong project.")
+        raise FileNotFoundError(f"Không tìm thấy {resource_file} trong project.")
 
     chosen = matches[0]
-    print(f"✔ Tìm thấy file nguồn: {chosen}")
+    log_success(f"Source file: {chosen}")
     return chosen
+
+
+def find_all_source_resources(project_root: Path, resource_file: str):
+    log_info(f"Finding all {resource_file} files in project: {project_root}")
+
+    matches = sorted(project_root.rglob(f"src/main/res/values/{resource_file}"))
+    if not matches:
+        raise FileNotFoundError(f"Không tìm thấy {resource_file} trong project.")
+
+    log_success(f"Found {len(matches)} source file(s):")
+    for match in matches:
+        print(f"  - {match}")
+    return matches
 
 
 def locale_to_values_dir(lang_tag: str) -> str:
@@ -272,11 +370,13 @@ def should_translate_text(text: str) -> bool:
     return True
 
 
-def translate_text(text: str, source_lang: str, target_lang: str, retries: int = RETRY_COUNT) -> str:
-    if not should_translate_text(text):
-        return text or ""
+def base_language_code(lang_tag: str) -> str:
+    code = (lang_tag or "").strip().replace("_", "-").split("-", 1)[0].lower()
+    return "id" if code == "in" else code
 
-    protected_text, tokens = protect_all(text)
+
+def translate_google(protected_text: str, source_lang: str, target_lang: str, retries: int) -> str:
+    import requests
 
     url = "https://translate.googleapis.com/translate_a/single"
     params = {
@@ -293,37 +393,192 @@ def translate_text(text: str, source_lang: str, target_lang: str, retries: int =
             resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
-            translated = "".join(chunk[0] for chunk in data[0])
-
-            # QUAN TRỌNG: Escape các ký tự đặc biệt của bản dịch TRƯỚC khi khôi phục tag/placeholder
-            translated = android_escape(translated)
-            translated = restore_all(translated, tokens)
-
-            return translated
-        except Exception as e:
-            last_error = e
+            return "".join(chunk[0] for chunk in data[0])
+        except Exception as error:
+            last_error = error
             if attempt < retries:
                 time.sleep(attempt)
 
-    print(f"[ERROR] Dịch thất bại ({source_lang}->{target_lang}): {last_error}")
-    # Nếu lỗi, trả về nguyên bản nhưng vẫn phải đảm bảo format XML hợp lệ
-    return text
+    raise RuntimeError(f"Google translation failed ({source_lang}->{target_lang}): {last_error}")
 
 
-def translate_words_in_segment(segment: str, source_lang: str, target_lang: str) -> str:
+def ensure_argos_translation(source_lang: str, target_lang: str):
+    global ARGOS_PACKAGE_INDEX_READY
+
+    try:
+        import argostranslate.package
+        import argostranslate.translate
+    except ImportError as error:
+        raise RuntimeError(
+            "Argos Translate chưa được cài. Chạy: python3 -m pip install argostranslate"
+        ) from error
+
+    source_code = base_language_code(source_lang)
+    target_code = base_language_code(target_lang)
+    if source_code == target_code:
+        return None
+
+    installed_languages = argostranslate.translate.get_installed_languages()
+    source = next((lang for lang in installed_languages if lang.code == source_code), None)
+    target = next((lang for lang in installed_languages if lang.code == target_code), None)
+    if source is not None and target is not None:
+        try:
+            return source.get_translation(target)
+        except Exception:
+            pass
+
+    with LOCAL_ENGINE_LOCK:
+        installed_languages = argostranslate.translate.get_installed_languages()
+        source = next((lang for lang in installed_languages if lang.code == source_code), None)
+        target = next((lang for lang in installed_languages if lang.code == target_code), None)
+        if source is not None and target is not None:
+            try:
+                return source.get_translation(target)
+            except Exception:
+                pass
+
+        if not ARGOS_PACKAGE_INDEX_READY:
+            log_info("Updating Argos package index...")
+            argostranslate.package.update_package_index()
+            ARGOS_PACKAGE_INDEX_READY = True
+
+        packages = argostranslate.package.get_available_packages()
+        package = next(
+            (
+                item
+                for item in packages
+                if item.from_code == source_code and item.to_code == target_code
+            ),
+            None,
+        )
+        if package is None:
+            raise RuntimeError(f"Argos does not provide language package {source_code}->{target_code}")
+
+        log_info(f"Downloading Argos model {source_code}->{target_code}...")
+        package_path = run_with_heartbeat(
+            f"Downloading Argos model {source_code}->{target_code}",
+            package.download,
+        )
+        run_with_heartbeat(
+            f"Installing Argos model {source_code}->{target_code}",
+            lambda: argostranslate.package.install_from_path(package_path),
+        )
+        log_success(f"Installed Argos model {source_code}->{target_code}")
+
+        installed_languages = argostranslate.translate.get_installed_languages()
+        source = next((lang for lang in installed_languages if lang.code == source_code), None)
+        target = next((lang for lang in installed_languages if lang.code == target_code), None)
+        if source is None or target is None:
+            raise RuntimeError(f"Argos model installed but language pair is unavailable: {source_code}->{target_code}")
+        return source.get_translation(target)
+
+
+def translate_argos(protected_text: str, source_lang: str, target_lang: str) -> str:
+    if base_language_code(source_lang) == base_language_code(target_lang):
+        return protected_text
+    translation = ensure_argos_translation(source_lang, target_lang)
+    return translation.translate(protected_text)
+
+
+def nllb_language_code(lang_tag: str) -> str:
+    base = base_language_code(lang_tag)
+    code = NLLB_LANGUAGE_CODES.get(base)
+    if not code:
+        raise RuntimeError(f"NLLB language mapping is not configured for: {lang_tag}")
+    return code
+
+
+def get_nllb_state():
+    global NLLB_STATE
+    if NLLB_STATE is not None:
+        return NLLB_STATE
+
+    with LOCAL_ENGINE_LOCK:
+        if NLLB_STATE is not None:
+            return NLLB_STATE
+        try:
+            import torch
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        except ImportError as error:
+            raise RuntimeError(
+                "NLLB dependencies chưa được cài. Chạy: python3 -m pip install torch transformers sentencepiece"
+            ) from error
+
+        log_info(f"Loading NLLB model {NLLB_MODEL_NAME}. The first run may download the model...")
+        tokenizer = run_with_heartbeat(
+            "Loading NLLB tokenizer",
+            lambda: AutoTokenizer.from_pretrained(NLLB_MODEL_NAME),
+        )
+        model = run_with_heartbeat(
+            "Downloading/loading NLLB model",
+            lambda: AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL_NAME),
+        )
+        model.eval()
+        NLLB_STATE = (torch, tokenizer, model)
+        log_success("NLLB model is ready.")
+        return NLLB_STATE
+
+
+def translate_nllb(protected_text: str, source_lang: str, target_lang: str) -> str:
+    source_code = nllb_language_code(source_lang)
+    target_code = nllb_language_code(target_lang)
+    if source_code == target_code:
+        return protected_text
+
+    torch, tokenizer, model = get_nllb_state()
+    tokenizer.src_lang = source_code
+    inputs = tokenizer(protected_text, return_tensors="pt", truncation=True, max_length=512)
+    target_id = tokenizer.convert_tokens_to_ids(target_code)
+    if target_id is None or target_id == tokenizer.unk_token_id:
+        raise RuntimeError(f"NLLB target language is unavailable: {target_code}")
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            forced_bos_token_id=target_id,
+            max_new_tokens=512,
+        )
+    return tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+
+
+def translate_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    retries: int = RETRY_COUNT,
+    engine: str = ENGINE_GOOGLE,
+) -> str:
+    if not should_translate_text(text):
+        return text or ""
+
+    protected_text, tokens = protect_all(text)
+
+    if engine == ENGINE_GOOGLE:
+        translated = translate_google(protected_text, source_lang, target_lang, retries)
+    elif engine == ENGINE_ARGOS:
+        translated = translate_argos(protected_text, source_lang, target_lang)
+    elif engine == ENGINE_NLLB:
+        translated = translate_nllb(protected_text, source_lang, target_lang)
+    else:
+        raise RuntimeError(f"Unsupported translation engine: {engine}")
+
+    translated = android_escape(translated)
+    return restore_all(translated, tokens)
+
+
+def translate_words_in_segment(segment: str, source_lang: str, target_lang: str, engine: str) -> str:
     parts = []
     last_end = 0
 
     for match in WORD_PATTERN.finditer(segment):
         parts.append(android_escape(segment[last_end:match.start()]))
-        parts.append(translate_text(match.group(0), source_lang, target_lang))
+        parts.append(translate_text(match.group(0), source_lang, target_lang, engine=engine))
         last_end = match.end()
 
     parts.append(android_escape(segment[last_end:]))
     return "".join(parts)
 
 
-def translate_word_by_word(text: str, source_lang: str, target_lang: str) -> str:
+def translate_word_by_word(text: str, source_lang: str, target_lang: str, engine: str) -> str:
     if not should_translate_text(text):
         return text or ""
 
@@ -332,11 +587,11 @@ def translate_word_by_word(text: str, source_lang: str, target_lang: str) -> str
     last_end = 0
 
     for match in PROTECTED_TOKEN_PATTERN.finditer(protected_text):
-        parts.append(translate_words_in_segment(protected_text[last_end:match.start()], source_lang, target_lang))
+        parts.append(translate_words_in_segment(protected_text[last_end:match.start()], source_lang, target_lang, engine))
         parts.append(match.group(0))
         last_end = match.end()
 
-    parts.append(translate_words_in_segment(protected_text[last_end:], source_lang, target_lang))
+    parts.append(translate_words_in_segment(protected_text[last_end:], source_lang, target_lang, engine))
     return restore_all("".join(parts), tokens)
 
 
@@ -455,7 +710,7 @@ def load_source_items(source_file: Path):
 
         resources.append({"kind": "raw", "element": deepcopy(child)})
 
-    print(f"✔ Đã load {len(items)} mục translatable từ {source_file}")
+    log_success(f"Loaded {len(items)} translatable item(s) from {source_file}")
     return items, resources
 
 
@@ -507,12 +762,16 @@ def has_existing_translation(existing_value: str) -> bool:
 
 
 def translate_item(task):
-    index, item, source_lang, target_lang, word_by_word = task
-    if word_by_word:
-        translated = translate_word_by_word(item["text"], source_lang, target_lang)
-    else:
-        translated = translate_text(item["text"], source_lang, target_lang)
-    return index, item_key(item), translated
+    index, item, source_lang, target_lang, word_by_word, engine = task
+    key = item_key(item)
+    try:
+        if word_by_word:
+            translated = translate_word_by_word(item["text"], source_lang, target_lang, engine)
+        else:
+            translated = translate_text(item["text"], source_lang, target_lang, engine=engine)
+        return index, key, translated, None
+    except Exception as error:
+        return index, key, item["text"], str(error)
 
 
 def parse_id_filters(raw_ids):
@@ -596,7 +855,8 @@ def write_target_resource(module_res_dir: Path, locale_tag: str, resource_file: 
         pretty_print=True,
     )
     out_file.write_bytes(xml_bytes)
-    print(f"✔ Xuất file: {out_file}")
+    log_success(f"Wrote {out_file}")
+    return out_file
 
 
 def parse_args():
@@ -637,49 +897,54 @@ def parse_args():
     parser.add_argument(
         "--resource-file",
         type=parse_resource_file_name,
-        default="strings.xml",
-        help="Tên file resource trong values cần dịch, ví dụ: strings.xml hoặc arrays.xml",
+        default=None,
+        help="Tên một file resource trong values cần dịch (tương thích CLI cũ)",
+    )
+    parser.add_argument(
+        "--resource-files",
+        nargs="+",
+        type=parse_resource_file_name,
+        help="Một hoặc nhiều tên file resource trong values cần dịch",
+    )
+    parser.add_argument(
+        "--resource-paths",
+        nargs="+",
+        help="Một hoặc nhiều đường dẫn resource XML tương đối từ project root",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=SUPPORTED_ENGINES,
+        default=ENGINE_GOOGLE,
+        help="Translation engine: google, argos hoặc nllb",
+    )
+    parser.add_argument(
+        "--all-modules",
+        action="store_true",
+        help="Dịch resource file này trong tất cả module có src/main/res/values",
     )
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    id_filters = parse_id_filters(args.ids)
-
-    config_path = Path(__file__).parent / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"❌ Không tìm thấy file config: {config_path}")
-
-    with config_path.open("r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    source_lang = config.get("source_language", "en")
-    target_langs = config.get("target_languages", [])
-
-    if not target_langs:
-        print("⚠ Không có target_languages trong config.json")
-        return
-
-    source_file = find_source_resource(args.project_root, args.resource_file)
+def translate_source_file(source_file: Path, args, source_lang: str, target_langs, id_filters, stats: RunStats):
     module_res_dir = source_file.parent.parent
+    resource_file = source_file.name
     source_items, resources = load_source_items(source_file)
 
     if id_filters:
         matched_ids = {item["name"] for item in source_items if item_matches_id_filter(item, id_filters)}
         unmatched_ids = id_filters - matched_ids - {item_key(item) for item in source_items}
-        print(f"🎯 Chỉ dịch {len(matched_ids)} resource id được chọn")
+        log_info(f"ID filter matched {len(matched_ids)} resource id(s).")
         if unmatched_ids:
-            print(f"⚠ Không tìm thấy id trong file nguồn: {', '.join(sorted(unmatched_ids))}")
+            log_warning(f"ID not found in source file: {', '.join(sorted(unmatched_ids))}", stats)
 
     if args.word_by_word:
-        print("🔤 Chế độ dịch từng từ đang bật")
+        log_info("Word-by-word mode is enabled.")
 
-    for lang in target_langs:
-        print(f"\n🌍 Đang dịch sang: {lang}")
+    for lang_index, lang in enumerate(target_langs, start=1):
+        log_section(f"Language [{lang_index}/{len(target_langs)}] {lang}")
 
         existing_translations = (
-            load_existing_translations(module_res_dir, lang, args.resource_file)
+            load_existing_translations(module_res_dir, lang, resource_file)
             if args.skip_translated or id_filters
             else {}
         )
@@ -701,36 +966,131 @@ def main():
 
         total_to_translate = len(tasks)
         completed = 0
+        stats.languages_processed += 1
+        stats.items_skipped += skipped_count
 
-        if args.skip_translated:
-            print(f"↷ Bỏ qua {skipped_count} mục đã có bản dịch")
+        effective_workers = max(1, args.workers)
+        log_info(
+            "Items: total={total}, translate={translate}, skipped={skipped}, workers={workers}, engine={engine}".format(
+                total=len(source_items),
+                translate=total_to_translate,
+                skipped=skipped_count,
+                workers=effective_workers,
+                engine=args.engine,
+            )
+        )
 
         if total_to_translate == 0:
-            print(f"✔ Không còn mục nào cần dịch cho {lang}")
-            write_target_resource(module_res_dir, lang, args.resource_file, resources, translated_map)
+            log_success(f"No pending translations for {lang}.")
+            write_target_resource(module_res_dir, lang, resource_file, resources, translated_map)
+            stats.files_written += 1
             continue
 
-        print(f"📝 Cần dịch {total_to_translate} mục cho {lang}")
-
         indexed_tasks = [
-            (index, item, source_lang, lang, args.word_by_word)
+            (index, item, source_lang, lang, args.word_by_word, args.engine)
             for index, item in enumerate(tasks)
         ]
 
         results = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = [executor.submit(translate_item, task) for task in indexed_tasks]
 
             for future in concurrent.futures.as_completed(futures):
-                _, key, translated = future.result()
+                _, key, translated, error = future.result()
                 results[key] = translated
                 completed += 1
-                print(f"[{completed}/{total_to_translate}] {key}")
+                if error:
+                    log_error(f"[{lang}] {key}: {error}", stats)
+                else:
+                    stats.items_translated += 1
+                print(f"  [{completed}/{total_to_translate}] {key}")
 
         translated_map.update(results)
-        write_target_resource(module_res_dir, lang, args.resource_file, resources, translated_map)
+        write_target_resource(module_res_dir, lang, resource_file, resources, translated_map)
+        stats.files_written += 1
 
-    print("\n🎉 DONE! Đã dịch xong tất cả ngôn ngữ.")
+
+def main():
+    args = parse_args()
+    id_filters = parse_id_filters(args.ids)
+    stats = RunStats()
+
+    config_path = Path(__file__).parent / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy file config: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    source_lang = config.get("source_language", "en")
+    target_langs = config.get("target_languages", [])
+
+    log_info(f"Translation engine: {args.engine}")
+
+    if not target_langs:
+        log_warning("Không có target_languages trong config.json", stats)
+        return
+
+    source_files = []
+    seen_paths = set()
+
+    if args.resource_paths:
+        for raw_path in args.resource_paths:
+            candidate = (args.project_root / raw_path).resolve()
+            try:
+                candidate.relative_to(args.project_root)
+            except ValueError as error:
+                raise ValueError(f"Resource path nằm ngoài project root: {raw_path}") from error
+            if not candidate.is_file() or candidate.suffix.lower() != ".xml":
+                raise FileNotFoundError(f"Không tìm thấy resource file: {candidate}")
+            if candidate not in seen_paths:
+                source_files.append(candidate)
+                seen_paths.add(candidate)
+    else:
+        resource_files = args.resource_files or ([args.resource_file] if args.resource_file else ["strings.xml"])
+        for resource_file in resource_files:
+            matches = (
+                find_all_source_resources(args.project_root, resource_file)
+                if args.all_modules
+                else [find_source_resource(args.project_root, resource_file)]
+            )
+            for match in matches:
+                if match not in seen_paths:
+                    source_files.append(match)
+                    seen_paths.add(match)
+
+    stats.modules_total = len(source_files)
+
+    for index, source_file in enumerate(source_files, start=1):
+        module_dir = source_file.parents[4]
+        log_section(
+            f"Resource [{index}/{len(source_files)}] {source_file.name} | module {module_dir.name}"
+        )
+        translate_source_file(source_file, args, source_lang, target_langs, id_filters, stats)
+        stats.modules_processed += 1
+
+    log_section("Summary")
+    log_success(f"Modules processed: {stats.modules_processed}/{stats.modules_total}")
+    log_success(f"Languages processed: {stats.languages_processed}")
+    log_success(f"Items translated: {stats.items_translated}")
+    log_success(f"Items skipped: {stats.items_skipped}")
+    log_success(f"Files written: {stats.files_written}")
+
+    if stats.warnings:
+        log_warning(f"Warnings: {len(stats.warnings)}")
+        for warning in stats.warnings[:10]:
+            print(f"  - {warning}")
+        if len(stats.warnings) > 10:
+            print(f"  - ... {len(stats.warnings) - 10} more")
+
+    if stats.errors:
+        log_error(f"Errors: {len(stats.errors)}")
+        for error in stats.errors[:10]:
+            print(f"  - {error}")
+        if len(stats.errors) > 10:
+            print(f"  - ... {len(stats.errors) - 10} more")
+    else:
+        log_success("Completed without translation errors.")
 
 
 if __name__ == "__main__":
