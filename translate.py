@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +68,7 @@ PROTECTED_TOKEN_PATTERN = re.compile(r"__[A-Z]+_\d+__")
 WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 PROTECTED_TOKEN_FULL_PATTERN = re.compile(r"__([A-Z]+)_(\d+)__")
 PROTECTED_TOKEN_DAMAGED_SUFFIX_PATTERN = re.compile(r"__([A-Z]+)_(\d+)_(?!_)")
+PROTECTED_TOKEN_SPACED_PATTERN = re.compile(r"_\s*_?\s*([A-Z]+)\s*_\s*(\d+)\s*_\s*_?")
 
 
 @dataclass
@@ -324,7 +326,57 @@ def restore_all(text: str, tokens: list) -> str:
 
     restored = PROTECTED_TOKEN_FULL_PATTERN.sub(restore_mutated_token, restored)
     restored = PROTECTED_TOKEN_DAMAGED_SUFFIX_PATTERN.sub(restore_mutated_token, restored)
+    restored = PROTECTED_TOKEN_SPACED_PATTERN.sub(restore_mutated_token, restored)
     return restored
+
+
+def extract_placeholder_signature(text: str) -> Counter:
+    placeholders = []
+    placeholders.extend(PRINTF_PLACEHOLDER_PATTERN.findall(text or ""))
+    placeholders.extend(BRACED_PLACEHOLDER_PATTERN.findall(text or ""))
+    return Counter(placeholders)
+
+
+def has_broken_protected_token(text: str) -> bool:
+    value = text or ""
+    return any(
+        pattern.search(value)
+        for pattern in (
+            PROTECTED_TOKEN_PATTERN,
+            PROTECTED_TOKEN_DAMAGED_SUFFIX_PATTERN,
+            PROTECTED_TOKEN_SPACED_PATTERN,
+        )
+    )
+
+
+class TranslationIntegrityError(RuntimeError):
+    pass
+
+
+def format_placeholder_signature(signature: Counter) -> str:
+    if not signature:
+        return "none"
+    parts = []
+    for placeholder, count in sorted(signature.items()):
+        parts.append(placeholder if count == 1 else f"{placeholder} x{count}")
+    return ", ".join(parts)
+
+
+def validate_translation_integrity(source_text: str, translated_text: str):
+    source_signature = extract_placeholder_signature(source_text)
+    translated_signature = extract_placeholder_signature(translated_text)
+
+    if source_signature != translated_signature:
+        raise TranslationIntegrityError(
+            "PLACEHOLDER_INTEGRITY: placeholders changed; "
+            f"expected [{format_placeholder_signature(source_signature)}], "
+            f"actual [{format_placeholder_signature(translated_signature)}]"
+        )
+
+    if has_broken_protected_token(translated_text):
+        raise TranslationIntegrityError(
+            "PLACEHOLDER_INTEGRITY: protected token could not be restored"
+        )
 
 
 def prefixes_are_close(value: str, expected: str) -> bool:
@@ -540,6 +592,67 @@ def translate_nllb(protected_text: str, source_lang: str, target_lang: str) -> s
     return tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
 
 
+def translate_engine_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    retries: int,
+    engine: str,
+) -> str:
+    if engine == ENGINE_GOOGLE:
+        return translate_google(text, source_lang, target_lang, retries)
+    if engine == ENGINE_ARGOS:
+        return translate_argos(text, source_lang, target_lang)
+    if engine == ENGINE_NLLB:
+        return translate_nllb(text, source_lang, target_lang)
+    raise RuntimeError(f"Unsupported translation engine: {engine}")
+
+
+def translate_plain_segment(
+    segment: str,
+    source_lang: str,
+    target_lang: str,
+    retries: int,
+    engine: str,
+) -> str:
+    if not segment or not any(char.isalpha() for char in segment):
+        return segment
+
+    match = re.fullmatch(r"(\s*)(.*?)(\s*)", segment, re.DOTALL)
+    if not match:
+        return segment
+
+    leading, core, trailing = match.groups()
+    if not core or not any(char.isalpha() for char in core):
+        return segment
+
+    translated = translate_engine_text(core, source_lang, target_lang, retries, engine)
+    return leading + android_escape(translated) + trailing
+
+
+def translate_segmented_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    retries: int,
+    engine: str,
+) -> str:
+    protected_text, tokens = protect_all(text)
+    token_map = dict(tokens)
+    parts = []
+    last_end = 0
+
+    for match in PROTECTED_TOKEN_PATTERN.finditer(protected_text):
+        plain_segment = protected_text[last_end:match.start()]
+        parts.append(translate_plain_segment(plain_segment, source_lang, target_lang, retries, engine))
+        parts.append(token_map.get(match.group(0), match.group(0)))
+        last_end = match.end()
+
+    trailing_segment = protected_text[last_end:]
+    parts.append(translate_plain_segment(trailing_segment, source_lang, target_lang, retries, engine))
+    return "".join(parts)
+
+
 def translate_text(
     text: str,
     source_lang: str,
@@ -550,19 +663,9 @@ def translate_text(
     if not should_translate_text(text):
         return text or ""
 
-    protected_text, tokens = protect_all(text)
-
-    if engine == ENGINE_GOOGLE:
-        translated = translate_google(protected_text, source_lang, target_lang, retries)
-    elif engine == ENGINE_ARGOS:
-        translated = translate_argos(protected_text, source_lang, target_lang)
-    elif engine == ENGINE_NLLB:
-        translated = translate_nllb(protected_text, source_lang, target_lang)
-    else:
-        raise RuntimeError(f"Unsupported translation engine: {engine}")
-
-    translated = android_escape(translated)
-    return restore_all(translated, tokens)
+    translated = translate_segmented_text(text, source_lang, target_lang, retries, engine)
+    validate_translation_integrity(text, translated)
+    return translated
 
 
 def translate_words_in_segment(segment: str, source_lang: str, target_lang: str, engine: str) -> str:
@@ -592,7 +695,9 @@ def translate_word_by_word(text: str, source_lang: str, target_lang: str, engine
         last_end = match.end()
 
     parts.append(translate_words_in_segment(protected_text[last_end:], source_lang, target_lang, engine))
-    return restore_all("".join(parts), tokens)
+    restored = restore_all("".join(parts), tokens)
+    validate_translation_integrity(text, restored)
+    return restored
 
 
 def make_string_item(name: str, text: str):
@@ -770,8 +875,10 @@ def translate_item(task):
         else:
             translated = translate_text(item["text"], source_lang, target_lang, engine=engine)
         return index, key, translated, None
-    except Exception as error:
+    except TranslationIntegrityError as error:
         return index, key, item["text"], str(error)
+    except Exception as error:
+        return index, key, item["text"], f"TRANSLATION_FAILED: {error}"
 
 
 def parse_id_filters(raw_ids):

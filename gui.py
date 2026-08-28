@@ -34,6 +34,8 @@ class AppState:
         self.next_log_id = 1
         self.status = "Ready"
         self.last_exit_code = None
+        self.error_count = 0
+        self.last_error = None
 
     def add_log(self, level, message):
         with self.lock:
@@ -45,6 +47,9 @@ class AppState:
             }
             self.next_log_id += 1
             self.logs.append(item)
+            if level == "ERROR":
+                self.error_count += 1
+                self.last_error = item["message"]
             if len(self.logs) > 3000:
                 self.logs = self.logs[-2500:]
             return item
@@ -69,6 +74,8 @@ class AppState:
                 "status": self.status,
                 "running": self.process is not None,
                 "exit_code": self.last_exit_code,
+                "error_count": self.error_count,
+                "last_error": self.last_error,
             }
 
 
@@ -149,8 +156,8 @@ def build_command(payload):
         raise ValueError("Workers must be a number") from error
     if workers_int < 1:
         raise ValueError("Workers must be at least 1")
-    if engine not in {"google", "argos", "nllb"}:
-        raise ValueError(f"Unsupported translation engine: {engine}")
+    if engine != "argos":
+        raise ValueError(f"Unsupported translation engine: {engine}. Only Argos is enabled right now.")
 
     python_executable = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
@@ -180,79 +187,151 @@ def build_command(payload):
 
 def run_doctor(payload):
     project_root = Path(str(payload.get("project_root") or "")).expanduser().resolve()
-    engine = str(payload.get("engine") or "google").strip().lower()
     resource_paths = payload.get("resource_paths") or []
     if isinstance(resource_paths, str):
         resource_paths = [resource_paths]
 
+    source_language = str(payload.get("source_language") or "en").strip() or "en"
+    target_languages = parse_target_languages(str(payload.get("target_languages") or ""))
+
     checks = []
+
     def add(name, status, detail=""):
         checks.append({"name": name, "status": status, "detail": detail})
 
     project_ok = project_root.is_dir()
     add("Project", "ok" if project_ok else "error", str(project_root) if project_ok else f"Not found: {project_root}")
-    if project_ok:
-        writable = os.access(project_root, os.W_OK)
-        add("Project writable", "ok" if writable else "error", "Writable" if writable else "No write permission")
 
     valid_resources = 0
-    for resource_path in resource_paths:
-        candidate = (project_root / str(resource_path)).resolve()
-        try:
-            candidate.relative_to(project_root)
-            if candidate.is_file():
-                valid_resources += 1
-        except ValueError:
-            pass
-    add("Resources", "ok" if valid_resources else "warn", f"{valid_resources}/{len(resource_paths)} selected file(s) valid")
+    writable_outputs = 0
+    if project_ok:
+        for resource_path in resource_paths:
+            candidate = (project_root / str(resource_path)).resolve()
+            try:
+                candidate.relative_to(project_root)
+            except ValueError:
+                continue
+            if not candidate.is_file():
+                continue
+
+            valid_resources += 1
+            values_dir = candidate.parent
+            res_dir = values_dir.parent
+            output_ok = os.access(values_dir, os.W_OK) and os.access(res_dir, os.W_OK)
+            if output_ok:
+                writable_outputs += 1
+
+    add(
+        "Resources",
+        "ok" if valid_resources and valid_resources == len(resource_paths) else "error",
+        f"{valid_resources}/{len(resource_paths)} selected file(s) valid",
+    )
+    add(
+        "Output writable",
+        "ok" if valid_resources and writable_outputs == valid_resources else "error",
+        f"{writable_outputs}/{valid_resources} target resource location(s) writable" if valid_resources else "No valid resource file selected",
+    )
 
     python_executable = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
-    add("Python runtime", "ok", python_executable)
-    add("Virtual environment", "ok" if VENV_PYTHON.exists() else "warn", "Ready" if VENV_PYTHON.exists() else "Missing .venv; run bash setup_local_engines.sh for local engines")
-
-    probe = '''
+    runtime_probe = '''
 import importlib.util, json, sys
-result = {"python": sys.version.split()[0], "deps": {}}
-for name in ["requests", "lxml", "argostranslate", "torch", "transformers", "sentencepiece"]:
-    result["deps"][name] = importlib.util.find_spec(name) is not None
+result = {
+    "python": sys.version.split()[0],
+    "deps": {
+        "lxml": importlib.util.find_spec("lxml") is not None,
+        "argostranslate": importlib.util.find_spec("argostranslate") is not None,
+    },
+}
 print(json.dumps(result))
 '''
     try:
-        completed = subprocess.run([python_executable, "-c", probe], capture_output=True, text=True, timeout=20)
-        runtime = json.loads(completed.stdout.strip()) if completed.returncode == 0 else {"deps": {}}
-    except Exception:
+        completed = subprocess.run(
+            [python_executable, "-c", runtime_probe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "Runtime probe failed").strip()
+            raise RuntimeError(detail)
+        runtime = json.loads(completed.stdout.strip())
+        add("Python environment", "ok", f"Python {runtime.get('python', '?')} · {python_executable}")
+    except Exception as error:
         runtime = {"deps": {}}
+        add("Python environment", "error", f"Runtime probe failed: {error}")
 
     deps = runtime.get("deps", {})
-    required = ["requests", "lxml"]
-    if engine == "argos":
-        required.append("argostranslate")
-    elif engine == "nllb":
-        required.extend(["torch", "transformers", "sentencepiece"])
-    missing = [name for name in required if not deps.get(name)]
-    add("Dependencies", "ok" if not missing else "error", "Ready" if not missing else f"Missing: {', '.join(missing)}. Run bash setup_local_engines.sh")
+    missing = [name for name in ("lxml", "argostranslate") if not deps.get(name)]
+    add(
+        "Dependencies",
+        "ok" if not missing else "error",
+        "lxml, argostranslate ready" if not missing else f"Missing: {', '.join(missing)}. Run bash setup_local_engines.sh",
+    )
 
-    if engine == "nllb" and deps.get("transformers"):
-        nllb_probe = '''
-import json
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-name = "facebook/nllb-200-distilled-600M"
-ready = True
-try:
-    AutoTokenizer.from_pretrained(name, local_files_only=True)
-    AutoModelForSeq2SeqLM.from_pretrained(name, local_files_only=True)
-except Exception:
+    if deps.get("argostranslate") and target_languages:
+        pair_probe = '''
+import json, sys
+import argostranslate.translate
+
+source = sys.argv[1]
+targets = json.loads(sys.argv[2])
+installed = argostranslate.translate.get_installed_languages()
+installed_by_code = {lang.code: lang for lang in installed}
+results = []
+for target in targets:
+    if source == target:
+        results.append({"target": target, "installed": True})
+        continue
+    src = installed_by_code.get(source)
+    dst = installed_by_code.get(target)
     ready = False
-print(json.dumps({"ready": ready}))
-'''
+    if src is not None and dst is not None:
         try:
-            completed = subprocess.run([python_executable, "-c", nllb_probe], capture_output=True, text=True, timeout=30)
-            ready = json.loads(completed.stdout.strip()).get("ready", False) if completed.returncode == 0 else False
-            add("NLLB model", "ok" if ready else "warn", "Cached locally" if ready else "Not cached; it will auto-download on Start")
-        except Exception as error:
-            add("NLLB model", "warn", f"Could not inspect cache: {error}")
+            src.get_translation(dst)
+            ready = True
+        except Exception:
+            ready = False
+    results.append({"target": target, "installed": ready})
+print(json.dumps(results))
+'''
+        source_code = source_language.replace("_", "-").split("-", 1)[0].lower()
+        if source_code == "in":
+            source_code = "id"
+        target_codes = []
+        for language in target_languages:
+            code = language.replace("_", "-").split("-", 1)[0].lower()
+            target_codes.append("id" if code == "in" else code)
 
-    return {"ok": not any(item["status"] == "error" for item in checks), "checks": checks}
+        try:
+            completed = subprocess.run(
+                [python_executable, "-c", pair_probe, source_code, json.dumps(target_codes)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "Argos pair probe failed").strip()
+                raise RuntimeError(detail)
+            pair_results = json.loads(completed.stdout.strip())
+            missing_pairs = [f"{source_code}->{item['target']}" for item in pair_results if not item.get("installed")]
+            add(
+                "Argos language pairs",
+                "ok" if not missing_pairs else "warn",
+                "All selected pairs installed" if not missing_pairs else f"Will download on Start: {', '.join(missing_pairs)}",
+            )
+        except Exception as error:
+            add("Argos language pairs", "warn", f"Could not inspect installed pairs: {error}")
+    elif deps.get("argostranslate"):
+        add("Argos language pairs", "warn", "No target languages configured")
+
+    error_count = sum(1 for item in checks if item["status"] == "error")
+    warning_count = sum(1 for item in checks if item["status"] == "warn")
+    return {
+        "ok": error_count == 0,
+        "checks": checks,
+        "error_count": error_count,
+        "warning_count": warning_count,
+    }
 
 
 def start_translation(payload):
@@ -280,6 +359,8 @@ def start_translation(payload):
         STATE.process = process
         STATE.status = "Running translation..."
         STATE.last_exit_code = None
+        STATE.error_count = 0
+        STATE.last_error = None
 
     STATE.add_log("SECTION", "$ " + shlex.join(command))
 
@@ -299,12 +380,18 @@ def read_process_output(process):
         if STATE.process is process:
             STATE.process = None
             STATE.reader_thread = None
-    if exit_code == 0:
+    with STATE.lock:
+        error_count = STATE.error_count
+
+    if exit_code == 0 and error_count == 0:
         STATE.set_status("Finished successfully", exit_code)
         STATE.add_log("OK", f"Process finished with exit code {exit_code}")
+    elif exit_code == 0:
+        STATE.set_status(f"Finished with {error_count} error(s)", exit_code)
+        STATE.add_log("WARN", f"Process completed with {error_count} translation error(s)")
     else:
-        STATE.set_status(f"Finished with exit code {exit_code}", exit_code)
-        STATE.add_log("ERROR", f"Process finished with exit code {exit_code}")
+        STATE.set_status(f"Failed with exit code {exit_code}", exit_code)
+        STATE.add_log("ERROR", f"Process failed with exit code {exit_code}")
 
 
 def stop_translation():
@@ -431,7 +518,16 @@ class GuiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/doctor":
                 payload = self.read_json()
-                self.send_json(run_doctor(payload))
+                result = run_doctor(payload)
+                error_count = result.get("error_count", 0)
+                warning_count = result.get("warning_count", 0)
+                if error_count:
+                    STATE.add_log("ERROR", f"Doctor failed: {error_count} error(s), {warning_count} warning(s)")
+                elif warning_count:
+                    STATE.add_log("WARN", f"Doctor completed: {warning_count} warning(s)")
+                else:
+                    STATE.add_log("OK", f"Doctor passed: {len(result.get('checks', []))} checks")
+                self.send_json(result)
                 return
             if parsed.path == "/api/start":
                 payload = self.read_json()
@@ -823,8 +919,6 @@ INDEX_HTML = r"""<!doctype html>
           <label for="engine">Engine</label>
           <select id="engine">
             <option value="argos" selected>Argos (local)</option>
-            <option value="nllb">NLLB-200 (local)</option>
-            <option value="google">Google GTX</option>
           </select>
           <label for="workers">Workers</label>
           <input id="workers" type="number" min="1" max="64" value="8">
@@ -1087,7 +1181,11 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const data = await api("/api/doctor", {method: "POST", body: JSON.stringify(payload())});
         renderDoctor(data.checks);
-        updateSummary(data.ok ? "Doctor: ready" : "Doctor: issues found");
+        const errorCount = data.error_count || 0;
+        const warningCount = data.warning_count || 0;
+        if (errorCount) updateSummary(`Doctor: ${errorCount} error(s), ${warningCount} warning(s)`);
+        else if (warningCount) updateSummary(`Doctor: ready with ${warningCount} warning(s)`);
+        else updateSummary("Doctor: ready");
         return data.ok;
       } finally {
         buttons.runDoctor.disabled = false;
