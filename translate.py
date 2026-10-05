@@ -81,6 +81,7 @@ class RunStats:
     files_written: int = 0
     warnings: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    language_results: dict = field(default_factory=dict)
 
 
 def log_section(title: str):
@@ -105,6 +106,65 @@ def log_error(message: str, stats=None):
     print(f"ERROR {message}")
     if stats is not None:
         stats.errors.append(message)
+
+
+def get_language_result(stats: RunStats, language: str) -> dict:
+    return stats.language_results.setdefault(
+        language,
+        {
+            "translated": [],
+            "failed": [],
+            "skipped": 0,
+        },
+    )
+
+
+def log_language_results(stats: RunStats):
+    log_section("Final translation summary")
+
+    for language, result in stats.language_results.items():
+        translated = result["translated"]
+        failed = result["failed"]
+        skipped = result["skipped"]
+        attempted = len(translated) + len(failed)
+
+        if attempted == 0:
+            log_success(f"[{language}] No pending translations: skipped={skipped}")
+        elif not failed:
+            log_success(
+                f"[{language}] Language completed: all {len(translated)} attempted key(s) "
+                f"translated successfully, skipped={skipped}"
+            )
+        elif not translated:
+            log_error(
+                f"[{language}] Language failed: all {len(failed)} attempted key(s) failed"
+            )
+        else:
+            log_warning(
+                f"[{language}] Language partially completed: "
+                f"translated={len(translated)}, failed={len(failed)}, skipped={skipped}"
+            )
+
+        for item in translated:
+            print(f"  OK   {item['resource']} | {item['key']}")
+        for item in failed:
+            print(f"  FAIL {item['resource']} | {item['key']}: {item['error']}")
+
+
+def log_final_results(stats: RunStats):
+    if stats.warnings:
+        log_warning(f"Warnings: {len(stats.warnings)}")
+        for warning in stats.warnings[:10]:
+            print(f"  - {warning}")
+        if len(stats.warnings) > 10:
+            print(f"  - ... {len(stats.warnings) - 10} more")
+
+    if stats.errors:
+        log_error(f"Key errors: {len(stats.errors)}")
+    else:
+        log_success("Completed without translation errors.")
+
+    log_language_results(stats)
 
 
 def run_with_heartbeat(label: str, action, interval_seconds: int = 5):
@@ -1035,6 +1095,10 @@ def parse_args():
 def translate_source_file(source_file: Path, args, source_lang: str, target_langs, id_filters, stats: RunStats):
     module_res_dir = source_file.parent.parent
     resource_file = source_file.name
+    try:
+        resource_label = str(source_file.relative_to(args.project_root))
+    except ValueError:
+        resource_label = str(source_file)
     source_items, resources = load_source_items(source_file)
 
     if id_filters:
@@ -1073,6 +1137,8 @@ def translate_source_file(source_file: Path, args, source_lang: str, target_lang
 
         total_to_translate = len(tasks)
         completed = 0
+        language_result = get_language_result(stats, lang)
+        language_result["skipped"] += skipped_count
         stats.languages_processed += 1
         stats.items_skipped += skipped_count
 
@@ -1099,18 +1165,27 @@ def translate_source_file(source_file: Path, args, source_lang: str, target_lang
         ]
 
         results = {}
+        ordered_outcomes = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = [executor.submit(translate_item, task) for task in indexed_tasks]
 
             for future in concurrent.futures.as_completed(futures):
-                _, key, translated, error = future.result()
+                item_index, key, translated, error = future.result()
                 results[key] = translated
+                ordered_outcomes.append((item_index, key, error))
                 completed += 1
                 if error:
-                    log_error(f"[{lang}] {key}: {error}", stats)
+                    stats.errors.append(f"[{lang}] {key}: {error}")
                 else:
                     stats.items_translated += 1
-                print(f"  [{completed}/{total_to_translate}] {key}")
+                print(f"  [{completed}/{total_to_translate}]")
+
+        for _, key, error in sorted(ordered_outcomes):
+            item_result = {"resource": resource_label, "key": key}
+            if error:
+                language_result["failed"].append({**item_result, "error": error})
+            else:
+                language_result["translated"].append(item_result)
 
         translated_map.update(results)
         write_target_resource(module_res_dir, lang, resource_file, resources, translated_map)
@@ -1183,21 +1258,7 @@ def main():
     log_success(f"Items skipped: {stats.items_skipped}")
     log_success(f"Files written: {stats.files_written}")
 
-    if stats.warnings:
-        log_warning(f"Warnings: {len(stats.warnings)}")
-        for warning in stats.warnings[:10]:
-            print(f"  - {warning}")
-        if len(stats.warnings) > 10:
-            print(f"  - ... {len(stats.warnings) - 10} more")
-
-    if stats.errors:
-        log_error(f"Errors: {len(stats.errors)}")
-        for error in stats.errors[:10]:
-            print(f"  - {error}")
-        if len(stats.errors) > 10:
-            print(f"  - ... {len(stats.errors) - 10} more")
-    else:
-        log_success("Completed without translation errors.")
+    log_final_results(stats)
 
 
 if __name__ == "__main__":

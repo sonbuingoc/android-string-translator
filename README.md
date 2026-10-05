@@ -117,7 +117,7 @@ Mặc định tool tìm Android project ở thư mục cha của repository này
 python3 gui.py
 ```
 
-GUI cho phép chọn Android project folder rồi tự scan từng file `src/main/res/values/*.xml` có `string`, `plurals` hoặc `string-array`. Mỗi file vật lý theo từng module/path được hiển thị riêng để người dùng chọn. GUI hỗ trợ `Argos (local)`, `NLLB-200 (local)` hoặc `Google GTX`; Argos là lựa chọn mặc định. Local engine tự tải model/package ở lần đầu và dùng cache local cho các lần sau. GUI cũng hỗ trợ `Skip translated`, `Word by word`, `Workers`, `IDs`, `source_language` và `target_languages`.
+GUI cho phép chọn Android project folder rồi tự scan từng file `src/main/res/values/*.xml` có `string`, `plurals` hoặc `string-array`. Mỗi file vật lý theo từng module/path được hiển thị riêng để người dùng chọn. GUI hỗ trợ `Argos (local)`, `NLLB-200 (local)` hoặc `Google GTX`; Argos là lựa chọn mặc định. Local engine tự tải model/package ở lần đầu và dùng cache local cho các lần sau. GUI cũng hỗ trợ `Skip translated`, `Word by word`, `Workers`, `IDs`, `source_language` và `target_languages`. Mỗi target language hiển thị trạng thái `Pending`, `Running`, `Success`, `Partial`, `Failed` hoặc `Stopped` trực tiếp trên chip.
 
 GUI chạy bằng local web server và tự mở browser ở `http://127.0.0.1:<port>`. Trên macOS, nút `Choose Folder` sẽ mở folder picker native; trên hệ khác có thể paste đường dẫn project thủ công.
 
@@ -261,9 +261,9 @@ OK    Loaded 49 translatable item(s) from /path/to/app/src/main/res/values/strin
 
 == Language [1/18] vi ==
 INFO  Items: total=49, translate=37, skipped=12, workers=8
-  [1/37] string::app_name
-  [2/37] string::welcome_message
-  [3/37] plural::deleted_files::one
+  [1/37]
+  [2/37]
+  [3/37]
 ...
 OK    Wrote /path/to/app/src/main/res/values-vi/strings.xml
 
@@ -274,6 +274,12 @@ OK    Items translated: 37
 OK    Items skipped: 12
 OK    Files written: 18
 OK    Completed without translation errors.
+
+== Final translation summary ==
+OK    [vi] Language completed: all 37 attempted key(s) translated successfully, skipped=12
+  OK   app/src/main/res/values/strings.xml | string::app_name
+  OK   app/src/main/res/values/strings.xml | string::welcome_message
+...
 ```
 
 ## Hỗ trợ resource
@@ -315,7 +321,9 @@ Tool cố gắng tránh làm hỏng các token quan trọng trong Android string
 ## Lưu ý
 
 - Tool dùng Google Translate free endpoint nên có thể bị giới hạn hoặc lỗi tạm thời nếu gửi quá nhiều request
-- Nếu một item dịch lỗi, tool sẽ in `ERROR` theo language/resource key, giữ text gốc cho item đó, và tổng hợp lỗi ở cuối run
+- Nếu một item dịch lỗi, tool giữ text gốc cho item đó và báo nguyên nhân trong tổng kết cuối cùng
+- Trong lúc dịch, tool chỉ in số tiến độ. `Final translation summary` được in sau khi toàn bộ resource hoàn tất và liệt kê từng key thành công hoặc thất bại theo ngôn ngữ
+- Nếu mọi key cần dịch đều thành công, ngôn ngữ được báo `OK`; nếu mọi key đều lỗi, ngôn ngữ được báo `ERROR`
 - Bản dịch tự động nên được kiểm tra lại với các câu có ngữ cảnh đặc biệt
 - Với XML phức tạp, bản dùng `lxml` sẽ giữ cấu trúc tốt hơn bản dùng `xml.etree`
 - Nếu một mục đã có bản dịch nhưng thực ra chưa đúng, hãy tắt `--skip-translated` để dịch lại

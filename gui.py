@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -24,6 +25,9 @@ CONFIG_PATH = SCRIPT_DIR / "config.json"
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = SCRIPT_DIR / ".venv" / "bin" / "python3"
 
+LANGUAGE_START_PATTERN = re.compile(r"^== Language \[\d+/\d+\] (.+) ==$")
+LANGUAGE_RESULT_PATTERN = re.compile(r"^(OK|WARN|ERROR)\s+\[([^]]+)\]\s+(.+)$")
+
 
 class AppState:
     def __init__(self):
@@ -36,6 +40,7 @@ class AppState:
         self.last_exit_code = None
         self.error_count = 0
         self.last_error = None
+        self.language_statuses = {}
 
     def add_log(self, level, message):
         with self.lock:
@@ -68,6 +73,29 @@ class AppState:
             self.status = status
             self.last_exit_code = exit_code
 
+    def reset_language_statuses(self, languages):
+        with self.lock:
+            self.language_statuses = {
+                language: {"status": "pending", "detail": "Waiting to start"}
+                for language in languages
+            }
+
+    def set_language_status(self, language, status, detail=""):
+        with self.lock:
+            self.language_statuses[language] = {
+                "status": status,
+                "detail": detail,
+            }
+
+    def finish_unfinished_languages(self, status, detail):
+        with self.lock:
+            for language, item in self.language_statuses.items():
+                if item["status"] in {"pending", "running"}:
+                    self.language_statuses[language] = {
+                        "status": status,
+                        "detail": detail,
+                    }
+
     def get_status(self):
         with self.lock:
             return {
@@ -76,10 +104,47 @@ class AppState:
                 "exit_code": self.last_exit_code,
                 "error_count": self.error_count,
                 "last_error": self.last_error,
+                "language_statuses": {
+                    language: dict(item)
+                    for language, item in self.language_statuses.items()
+                },
             }
 
 
 STATE = AppState()
+
+
+def update_language_status_from_line(line, state=None):
+    state = state or STATE
+    message = line.rstrip("\n")
+
+    start_match = LANGUAGE_START_PATTERN.match(message)
+    if start_match:
+        state.set_language_status(
+            start_match.group(1),
+            "running",
+            "Translation in progress",
+        )
+        return
+
+    result_match = LANGUAGE_RESULT_PATTERN.match(message)
+    if not result_match:
+        return
+
+    level, language, detail = result_match.groups()
+    if level == "OK" and (
+        detail.startswith("Language completed")
+        or detail.startswith("No pending translations")
+    ):
+        status = "success"
+    elif level == "WARN" and detail.startswith("Language partially completed"):
+        status = "partial"
+    elif level == "ERROR" and detail.startswith("Language failed"):
+        status = "failed"
+    else:
+        return
+
+    state.set_language_status(language, status, detail)
 
 
 def read_config():
@@ -156,8 +221,8 @@ def build_command(payload):
         raise ValueError("Workers must be a number") from error
     if workers_int < 1:
         raise ValueError("Workers must be at least 1")
-    if engine != "argos":
-        raise ValueError(f"Unsupported translation engine: {engine}. Only Argos is enabled right now.")
+    if engine not in {"google", "argos", "nllb"}:
+        raise ValueError(f"Unsupported translation engine: {engine}")
 
     python_executable = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
@@ -233,6 +298,7 @@ def run_doctor(payload):
     )
 
     python_executable = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+    engine = str(payload.get("engine") or "argos").strip().lower()
     runtime_probe = '''
 import importlib.util, json, sys
 result = {
@@ -240,6 +306,9 @@ result = {
     "deps": {
         "lxml": importlib.util.find_spec("lxml") is not None,
         "argostranslate": importlib.util.find_spec("argostranslate") is not None,
+        "torch": importlib.util.find_spec("torch") is not None,
+        "transformers": importlib.util.find_spec("transformers") is not None,
+        "sentencepiece": importlib.util.find_spec("sentencepiece") is not None,
     },
 }
 print(json.dumps(result))
@@ -261,14 +330,19 @@ print(json.dumps(result))
         add("Python environment", "error", f"Runtime probe failed: {error}")
 
     deps = runtime.get("deps", {})
-    missing = [name for name in ("lxml", "argostranslate") if not deps.get(name)]
+    required_deps = {
+        "argos": ("lxml", "argostranslate"),
+        "nllb": ("lxml", "torch", "transformers", "sentencepiece"),
+        "google": ("lxml",),
+    }.get(engine, ("lxml",))
+    missing = [name for name in required_deps if not deps.get(name)]
     add(
         "Dependencies",
         "ok" if not missing else "error",
-        "lxml, argostranslate ready" if not missing else f"Missing: {', '.join(missing)}. Run bash setup_local_engines.sh",
+        f"{', '.join(required_deps)} ready" if not missing else f"Missing: {', '.join(missing)}. Run bash setup_local_engines.sh",
     )
 
-    if deps.get("argostranslate") and target_languages:
+    if engine == "argos" and deps.get("argostranslate") and target_languages:
         pair_probe = '''
 import json, sys
 import argostranslate.translate
@@ -321,7 +395,7 @@ print(json.dumps(results))
             )
         except Exception as error:
             add("Argos language pairs", "warn", f"Could not inspect installed pairs: {error}")
-    elif deps.get("argostranslate"):
+    elif engine == "argos" and deps.get("argostranslate"):
         add("Argos language pairs", "warn", "No target languages configured")
 
     error_count = sum(1 for item in checks if item["status"] == "error")
@@ -355,6 +429,8 @@ def start_translation(payload):
         env=env,
     )
 
+    STATE.reset_language_statuses(target_languages)
+
     with STATE.lock:
         STATE.process = process
         STATE.status = "Running translation..."
@@ -373,6 +449,7 @@ def start_translation(payload):
 def read_process_output(process):
     assert process.stdout is not None
     for line in process.stdout:
+        update_language_status_from_line(line)
         STATE.add_log(level_for_line(line), line)
 
     exit_code = process.wait()
@@ -385,11 +462,17 @@ def read_process_output(process):
 
     if exit_code == 0 and error_count == 0:
         STATE.set_status("Finished successfully", exit_code)
-        STATE.add_log("OK", f"Process finished with exit code {exit_code}")
     elif exit_code == 0:
         STATE.set_status(f"Finished with {error_count} error(s)", exit_code)
-        STATE.add_log("WARN", f"Process completed with {error_count} translation error(s)")
+    elif exit_code < 0:
+        STATE.finish_unfinished_languages("stopped", "Translation was stopped")
+        STATE.set_status("Stopped", exit_code)
+        STATE.add_log("WARN", f"Process stopped with exit code {exit_code}")
     else:
+        STATE.finish_unfinished_languages(
+            "failed",
+            f"Process failed with exit code {exit_code}",
+        )
         STATE.set_status(f"Failed with exit code {exit_code}", exit_code)
         STATE.add_log("ERROR", f"Process failed with exit code {exit_code}")
 
@@ -701,6 +784,19 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 700;
       padding: 4px 10px;
     }
+    .target-chip.status-pending,
+    .target-chip.status-idle { background: #f8fafc; border-color: #cbd5e1; color: #475569; }
+    .target-chip.status-running { background: #eff6ff; border-color: #60a5fa; color: #1d4ed8; }
+    .target-chip.status-success { background: #f0fdf4; border-color: #4ade80; color: #15803d; }
+    .target-chip.status-partial { background: #fffbeb; border-color: #facc15; color: #a16207; }
+    .target-chip.status-failed { background: #fef2f2; border-color: #f87171; color: #b91c1c; }
+    .target-chip.status-stopped { background: #f8fafc; border-color: #94a3b8; color: #475569; }
+    .target-chip-status {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+    }
     .target-empty {
       color: var(--muted);
       font-size: 14px;
@@ -919,6 +1015,8 @@ INDEX_HTML = r"""<!doctype html>
           <label for="engine">Engine</label>
           <select id="engine">
             <option value="argos" selected>Argos (local)</option>
+            <option value="nllb">NLLB-200 (local)</option>
+            <option value="google">Google GTX</option>
           </select>
           <label for="workers">Workers</label>
           <input id="workers" type="number" min="1" max="64" value="8">
@@ -1001,6 +1099,7 @@ INDEX_HTML = r"""<!doctype html>
     let selectedResourceFiles = new Set();
     let lastLogId = 0;
     let isRunning = false;
+    let targetStatuses = {};
 
     function parseTargets() {
       const seen = new Set();
@@ -1117,10 +1216,29 @@ INDEX_HTML = r"""<!doctype html>
 
       const list = document.createElement("div");
       list.className = "target-list";
+      const statusLabels = {
+        idle: "Idle",
+        pending: "Pending",
+        running: "Running",
+        success: "Success",
+        partial: "Partial",
+        failed: "Failed",
+        stopped: "Stopped",
+      };
       for (const target of targets) {
         const chip = document.createElement("span");
-        chip.className = "target-chip";
-        chip.textContent = target;
+        const statusInfo = targetStatuses[target] || {status: "idle", detail: "Not started"};
+        const status = statusInfo.status || "idle";
+        chip.className = `target-chip status-${status}`;
+        chip.title = statusInfo.detail || statusLabels[status] || status;
+
+        const name = document.createElement("span");
+        name.textContent = target;
+        const separator = document.createTextNode(" · ");
+        const statusText = document.createElement("span");
+        statusText.className = "target-chip-status";
+        statusText.textContent = statusLabels[status] || status;
+        chip.append(name, separator, statusText);
         list.appendChild(chip);
       }
       summary.targets.appendChild(list);
@@ -1195,6 +1313,9 @@ INDEX_HTML = r"""<!doctype html>
     async function start() {
       buttons.runToggle.disabled = true;
       await api("/api/start", {method: "POST", body: JSON.stringify(payload())});
+      targetStatuses = Object.fromEntries(
+        parseTargets().map(target => [target, {status: "pending", detail: "Waiting to start"}])
+      );
       updateSummary("Running translation...");
       syncRunButton(true);
     }
@@ -1250,6 +1371,8 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const data = await api(`/api/logs?after=${lastLogId}`);
         for (const item of data.logs) addLog(item);
+        targetStatuses = data.language_statuses || {};
+        renderTargets(parseTargets());
         summary.status.textContent = data.status;
         syncRunButton(data.running);
       } catch (error) {
